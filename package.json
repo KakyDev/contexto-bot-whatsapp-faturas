@@ -1,0 +1,31 @@
+{
+  "name": "whatsapp-invoice-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/app.ts",
+    "dev:terminal": "tsx src/app.ts --transport terminal",
+    "dev:browser": "tsx src/app.ts --transport browser",
+    "start": "node dist/app.js",
+    "dry-run": "tsx src/app.ts --dry-run",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "pino": "^10.1.0",
+    "playwright": "^1.56.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.7",
+    "xlsx": "^0.18.5",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  }
+}
