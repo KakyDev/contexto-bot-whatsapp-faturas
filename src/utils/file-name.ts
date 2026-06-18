@@ -22,7 +22,7 @@ export function sanitizeFilePart(value: string): string {
 
 export function invoicePdfFileNameForJob(job: InvoiceJob): string {
   const base = sanitizeFilePart(job.codigoVenda || job.identificador);
-  const reference = sanitizeFilePart(job.refOriginal || job.mesReferencia);
+  const reference = sanitizeFilePart(job.mesReferencia || job.refOriginal);
   return `${base}_${reference}.pdf`;
 }
 

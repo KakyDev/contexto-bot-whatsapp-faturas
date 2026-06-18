@@ -321,8 +321,27 @@ export class WhatsAppClient {
         return directDownload;
       }
 
+      const openedFromDocumentControl = await this.openLatestPdfCardFromDocumentControl();
+      if (openedFromDocumentControl) {
+        const previewDownload = await this.tryDownloadFromOpenPreview(Math.min(remaining, 15000));
+        if (previewDownload) {
+          await this.closeDocumentPreview();
+          return previewDownload;
+        }
+
+        const previewPdf = await this.saveOpenPdfPreviewToTempFile(Math.min(remaining, 15000));
+        await this.closeDocumentPreview();
+        if (previewPdf) return previewPdf;
+      }
+
       const openedFromText = await this.openLatestPdfCardFromVisibleText();
       if (openedFromText) {
+        const previewDownload = await this.tryDownloadFromOpenPreview(Math.min(remaining, 15000));
+        if (previewDownload) {
+          await this.closeDocumentPreview();
+          return previewDownload;
+        }
+
         const previewPdf = await this.saveOpenPdfPreviewToTempFile(Math.min(remaining, 15000));
         await this.closeDocumentPreview();
         if (previewPdf) return previewPdf;
@@ -330,6 +349,12 @@ export class WhatsAppClient {
 
       const cardOpened = await this.openLatestPdfCard();
       if (cardOpened) {
+        const previewDownload = await this.tryDownloadFromOpenPreview(Math.min(remaining, 15000));
+        if (previewDownload) {
+          await this.closeDocumentPreview();
+          return previewDownload;
+        }
+
         const previewPdf = await this.saveOpenPdfPreviewToTempFile(Math.min(remaining, 15000));
         await this.closeDocumentPreview();
         if (previewPdf) return previewPdf;
@@ -356,11 +381,42 @@ export class WhatsAppClient {
     ];
 
     for (const candidate of candidates) {
-      const download = await this.tryDownloadFromClick(candidate, timeoutMs);
+      const download = await this.tryDownloadFromClick(candidate, timeoutMs, page);
       if (download) return download;
     }
 
     return undefined;
+  }
+
+  private async openLatestPdfCardFromDocumentControl(): Promise<boolean> {
+    const page = this.getPage();
+    const candidates = [
+      page.locator('main [aria-label*=".pdf" i]').last(),
+      page.locator('main [title*=".pdf" i]').last(),
+      page.locator('main [aria-label*="mostrar" i]').last(),
+      page.locator('main [title*="mostrar" i]').last()
+    ];
+
+    for (const candidate of candidates) {
+      if (!(await candidate.isVisible({ timeout: 1000 }).catch(() => false))) continue;
+
+      await candidate.scrollIntoViewIfNeeded().catch(() => undefined);
+      const popupPromise = this.waitForDocumentPopup();
+      await candidate.click({ timeout: 3000, force: true }).catch(() => undefined);
+      const popup = await popupPromise;
+      if (popup) {
+        await this.captureDocumentPreviewPage(popup, "controle do cartao PDF");
+        return true;
+      }
+
+      await delay(1000);
+      if (await this.isDocumentPreviewOpen()) {
+        logger.info("preview do pdf aberto pelo controle do cartao");
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async saveOpenPdfPreviewToTempFile(timeoutMs: number): Promise<string | undefined> {
@@ -677,10 +733,9 @@ export class WhatsAppClient {
     );
   }
 
-  private async tryDownloadFromClick(locator: Locator, timeoutMs: number): Promise<Download | undefined> {
+  private async tryDownloadFromClick(locator: Locator, timeoutMs: number, page = this.getPage()): Promise<Download | undefined> {
     if (!(await locator.isVisible({ timeout: 1000 }).catch(() => false))) return undefined;
 
-    const page = this.getPage();
     const downloadPromise = page.waitForEvent("download", { timeout: timeoutMs }).catch(() => undefined);
     await locator.scrollIntoViewIfNeeded().catch(() => undefined);
     await locator.click({ timeout: 3000 }).catch(() => undefined);

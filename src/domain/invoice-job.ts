@@ -16,6 +16,7 @@ export const rawInvoiceJobSchema = z.object({
   mes_referencia: z.union([z.string(), z.number()]).optional(),
   ref: z.union([z.string(), z.number()]).optional(),
   empresa: z.union([z.string(), z.number()]).optional(),
+  data_de_nascimento: z.union([z.string(), z.number()]).optional(),
   observacao: z.union([z.string(), z.number()]).optional(),
   status: z.string().optional()
 }).passthrough();
@@ -28,13 +29,28 @@ export interface InvoiceJob {
   identificador: string;
   uc: string;
   cpfCnpj: string;
+  cpfPrimeiros4: string;
+  cpfUltimos4: string;
   documentLastDigits: string;
   nomeTitular: string;
   mesReferencia: string;
   refOriginal: string;
+  dataDeNascimento: string;
   empresa: string;
   observacao: string;
   status?: string;
+}
+
+export interface InvoiceJobGroup {
+  id: string;
+  codigoVenda: string;
+  uc: string;
+  identificador: string;
+  documento: string;
+  jobs: InvoiceJob[];
+  mesesDesejados: string[];
+  mesesBaixados: string[];
+  mesesPendentes: string[];
 }
 
 function requiredCell(value: unknown, field: string): string {
@@ -66,12 +82,24 @@ export function toInvoiceJob(raw: RawInvoiceJob, index: number): InvoiceJob {
   const cpfCnpj = normalizeDigits(requiredCell(raw.cpf_cnpj ?? raw.cpf, "cpf_cnpj/cpf"));
   const refOriginal = requiredCell(raw.mes_referencia ?? raw.ref, "mes_referencia/ref");
   const mesReferencia = normalizeReference(refOriginal);
+  const rawDataDeNascimento = raw.data_de_nascimento === undefined ? "" : String(raw.data_de_nascimento).trim();
+  const normalizedBirthDate = rawDataDeNascimento.toLowerCase() === "undefined" ? "" : rawDataDeNascimento;
+  const validBirthDate = /^\d{2}\/\d{2}\/\d{4}$/.test(normalizedBirthDate) ? normalizedBirthDate : "";
+  const dataDeNascimento = normalizedBirthDate === "0" ? "" : validBirthDate;
+  
+  // Extrai 4 primeiros e 4 últimos dígitos do CPF inteiro
+  const cpfPrimeiros4 = cpfCnpj.slice(0, 4);
+  const cpfUltimos4 = cpfCnpj.slice(-4);
+  
+  // Mantém compatibilidade com a lógica anterior (padrão é 4 primeiros)
   const firstDigitsFromColumn = normalizeDigits(String(raw["4 primeiros"] ?? ""));
-  const documentLastDigits = /^\d{4}$/.test(firstDigitsFromColumn) ? firstDigitsFromColumn : cpfCnpj.slice(0, 4);
+  const documentLastDigits = /^\d{4}$/.test(firstDigitsFromColumn) ? firstDigitsFromColumn : cpfPrimeiros4;
 
   if (!/^\d+$/.test(identificador)) throw new Error("identificador deve conter somente numeros");
   if (!/^\d+$/.test(cpfCnpj)) throw new Error("cpf_cnpj deve conter somente numeros");
   if (!/^\d{4}$/.test(documentLastDigits)) throw new Error("4 primeiros do cpf_cnpj/cpf deve conter 4 digitos");
+  if (!/^\d{4}$/.test(cpfPrimeiros4)) throw new Error("CPF deve ter pelo menos 4 dígitos");
+  if (!/^\d{4}$/.test(cpfUltimos4)) throw new Error("CPF deve ter pelo menos 4 dígitos");
 
   return {
     id: buildJobId(raw.id, codigoVenda, refOriginal, index),
@@ -79,12 +107,49 @@ export function toInvoiceJob(raw: RawInvoiceJob, index: number): InvoiceJob {
     identificador,
     uc: raw.uc === undefined ? "" : normalizeDigits(String(raw.uc)),
     cpfCnpj,
+    cpfPrimeiros4,
+    cpfUltimos4,
     documentLastDigits,
     nomeTitular: raw.nome_titular === undefined ? "" : String(raw.nome_titular).trim(),
     mesReferencia,
     refOriginal,
+    dataDeNascimento,
     empresa: raw.empresa === undefined ? String(raw.concessionaria ?? "").trim() : String(raw.empresa).trim(),
     observacao: raw.observacao === undefined ? "" : String(raw.observacao).trim(),
     status: raw.status
   };
+}
+
+export function groupInvoiceJobs(jobs: InvoiceJob[]): InvoiceJobGroup[] {
+  const groups = new Map<string, InvoiceJobGroup>();
+
+  for (const job of jobs) {
+    const accountKey = job.codigoVenda
+      ? `codigo:${job.codigoVenda}|uc:${job.uc || job.identificador}`
+      : `uc:${job.uc || job.identificador}|documento:${job.cpfCnpj}`;
+    const existing = groups.get(accountKey);
+
+    if (existing) {
+      existing.jobs.push(job);
+      if (!existing.mesesDesejados.includes(job.mesReferencia)) {
+        existing.mesesDesejados.push(job.mesReferencia);
+        existing.mesesPendentes.push(job.mesReferencia);
+      }
+      continue;
+    }
+
+    groups.set(accountKey, {
+      id: accountKey,
+      codigoVenda: job.codigoVenda,
+      uc: job.uc || job.identificador,
+      identificador: job.identificador,
+      documento: job.cpfCnpj,
+      jobs: [job],
+      mesesDesejados: [job.mesReferencia],
+      mesesBaixados: [],
+      mesesPendentes: [job.mesReferencia]
+    });
+  }
+
+  return [...groups.values()];
 }

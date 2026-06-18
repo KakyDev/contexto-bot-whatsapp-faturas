@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { groupInvoiceJobs } from "../src/domain/invoice-job.js";
 import { readSpreadsheet } from "../src/services/spreadsheet-reader.js";
 
 describe("spreadsheet-reader", () => {
@@ -90,6 +91,34 @@ describe("spreadsheet-reader", () => {
 
     expect(jobs.map((job) => job.id)).toEqual(["03B2FF9_05-2026", "03B2FF9_06-2026"]);
     expect(jobs.map((job) => job.mesReferencia)).toEqual(["05/2026", "06/2026"]);
+
+    fs.unlinkSync(file);
+  });
+
+  it("agrupa registros da mesma UC e codigo_venda mantendo os meses desejados", () => {
+    const file = path.join(os.tmpdir(), `ceee-grupo-${Date.now()}.csv`);
+    fs.writeFileSync(
+      file,
+      [
+        "codigo_venda;concessionaria;uc;cpf;4 ultimos;ref",
+        "03B2FF9;CEEE Equatorial;32218567;56644663087;3087;05/2026",
+        "03B2FF9;CEEE Equatorial;32218567;56644663087;3087;06/2026",
+        "99X1AA2;CEEE Equatorial;99999999;12345678901;8901;06/2026"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const groups = groupInvoiceJobs(readSpreadsheet(file));
+
+    expect(groups).toHaveLength(2);
+    expect(groups[0]).toMatchObject({
+      codigoVenda: "03B2FF9",
+      uc: "32218567",
+      mesesDesejados: ["05/2026", "06/2026"],
+      mesesBaixados: [],
+      mesesPendentes: ["05/2026", "06/2026"]
+    });
+    expect(groups[0].jobs.map((job) => job.id)).toEqual(["03B2FF9_05-2026", "03B2FF9_06-2026"]);
 
     fs.unlinkSync(file);
   });

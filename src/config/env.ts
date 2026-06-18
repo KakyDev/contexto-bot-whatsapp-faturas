@@ -1,4 +1,5 @@
 import path from "node:path";
+import os from "node:os";
 import { config } from "dotenv";
 import { z } from "zod";
 
@@ -9,6 +10,8 @@ const boolFromString = z
   .optional()
   .default("false")
   .transform((value) => value.toLowerCase() === "true");
+
+const defaultInvoicesDir = path.join(os.homedir(), "OneDrive", "Desktop", "Teste Bot CEEE");
 
 const envSchema = z.object({
   NODE_ENV: z.string().default("development"),
@@ -28,7 +31,8 @@ const envSchema = z.object({
   MAX_RETRIES: z.coerce.number().min(1).default(2),
   INPUT_FILE: z.string().default("./data/entrada.xlsx"),
   OUTPUT_RESULTS_FILE: z.string().default("./output/resultados.csv"),
-  OUTPUT_INVOICES_DIR: z.string().default("C:\\Users\\lex-t\\Downloads\\Bot CEEE"),
+  OUTPUT_ATTEMPTS_FILE: z.string().default("./output/attempts.csv"),
+  OUTPUT_INVOICES_DIR: z.string().default(defaultInvoicesDir),
   OUTPUT_ERROR_SCREENSHOTS_DIR: z.string().default("./output/errors/screenshots"),
   DEFAULT_INITIAL_MESSAGE: z.string().default("Ola"),
   DEFAULT_RATING: z.string().default("5"),

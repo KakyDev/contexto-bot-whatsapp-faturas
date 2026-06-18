@@ -1,38 +1,50 @@
 import path from "node:path";
 import fs from "node:fs";
-import type { InvoiceJob } from "../domain/invoice-job.js";
+import type { InvoiceJob, InvoiceJobGroup } from "../domain/invoice-job.js";
 import type { InvoiceStatus } from "../domain/invoice-status.js";
 import { env, resolveProjectPath } from "../config/env.js";
 import { logger } from "./logger.js";
 import { assertSavedPdf, saveDownload } from "./pdf-downloader.js";
 import type { ConversationClient } from "./conversation-client.js";
 import { normalizeText } from "../utils/normalize.js";
-import { findInvoiceOption, latestInvoiceSelectionBlock, parseInvoices } from "../utils/parse-invoices.js";
+import { maskDocument } from "../utils/mask-document.js";
+import { findInvoiceOption, latestInvoiceSelectionBlock, parseInvoices, type ParsedInvoice } from "../utils/parse-invoices.js";
 import { invoicePdfPathForJob, sanitizeFilePart, timestampForFile } from "../utils/file-name.js";
 import { delay } from "../utils/delay.js";
 import {
   accountConfirmationPatterns,
+  birthDateRequestPatterns,
   consentRequestPatterns,
   conversationRecoveryPatterns,
   describeConversationIntent,
   documentDigitsInvalidPatterns,
   documentDigitsRequestPatterns,
   donePatterns,
+  finalGoodbyePatterns,
+  identifierRejectedPatterns,
   identifierRequestPatterns,
   invalidDataPatterns,
   invoiceListPatterns,
   invoiceServicePatterns,
+  isPedindoDataDeNascimento,
+  isPedindoRg,
+  isPedindoUltimos,
   matchesAny,
   moreInvoiceQuestionPatterns,
   moreSubjectQuestionPatterns,
+  noOpenDebtsPatterns,
   paymentMethodPatterns,
   pdfReadyPatterns,
   pixQuestionPatterns,
-  ratingQuestionPatterns
+  ratingQuestionPatterns,
+  rgDigitsRequestPatterns,
+  suspendedSupplyQuestionPatterns,
+  unsupportedSubjectPatterns
 } from "../utils/conversation-matchers.js";
 
 const QUICK_STATE_TIMEOUT_MS = env.BOT_STEP_TIMEOUT_MS;
 const RECOVERY_PROBE_ATTEMPTS = 3;
+const UNSUPPORTED_SUBJECT_PROBE_TIMEOUT_MS = Math.max(env.BOT_STEP_TIMEOUT_MS, 90_000);
 
 type ConversationIntent =
   | "consent_request"
@@ -50,6 +62,9 @@ type ConversationIntent =
   | "rating_question"
   | "done"
   | "invalid_data"
+  | "no_open_debts"
+  | "suspended_supply_question"
+  | "unsupported_subject"
   | "unknown";
 
 export interface ConversationResult {
@@ -58,10 +73,19 @@ export interface ConversationResult {
   erro?: string;
 }
 
+export interface ConversationJobResult extends ConversationResult {
+  job: InvoiceJob;
+}
+
+export interface ConversationGroupResult {
+  results: ConversationJobResult[];
+}
+
 class ConversationFailure extends Error {
   constructor(
     public readonly status: InvoiceStatus,
-    message: string
+    message: string,
+    public readonly conversationClosed = false
   ) {
     super(message);
   }
@@ -71,58 +95,218 @@ export class CeeeConversationBot {
   constructor(private readonly client: ConversationClient) {}
 
   async process(job: InvoiceJob): Promise<ConversationResult> {
+    const group = this.groupFromSingleJob(job);
+    const result = await this.processGroup(group);
+    const [firstResult] = result.results;
+    return firstResult ?? { status: "conversation_error", erro: "Nenhum resultado retornado" };
+  }
+
+  async processGroup(group: InvoiceJobGroup): Promise<ConversationGroupResult> {
+    const representativeJob = group.jobs[0];
+    if (!representativeJob) return { results: [] };
+
+    const results = new Map<string, ConversationResult>();
+    const pendingReferences = new Set(group.mesesDesejados);
+    const downloadedReferences = new Set<string>();
+    let lastDownloadedJob = representativeJob;
+
     try {
-      logger.info({ identificador: job.identificador, state: "INIT" }, "iniciando conversa");
+      logger.info(
+        {
+          identificador: representativeJob.identificador,
+          codigoVenda: group.codigoVenda,
+          uc: group.uc,
+          mesesDesejados: group.mesesDesejados,
+          state: "INIT"
+        },
+        "iniciando conversa agrupada"
+      );
       await this.client.openConversationByPhone(env.WHATSAPP_CONTACT_PHONE);
       await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
 
       const currentText = await this.waitInitialResponseAfterHello();
-      const invoiceText = await this.navigateUntilInvoiceList(job, currentText);
-      this.throwIfInvalidData(invoiceText);
-      const invoices = parseInvoices(invoiceText);
-      logger.info(
-        {
-          identificador: job.identificador,
-          referenciaCsv: job.refOriginal,
-          referenciaProcurada: job.mesReferencia,
-          faturasEncontradas: invoices.map((item) => ({
-            option: item.option,
-            reference: item.reference,
-            value: item.value,
-            dueDate: item.dueDate
-          }))
-        },
-        "faturas abertas analisadas"
-      );
-      const invoice = findInvoiceOption(invoiceText, job.mesReferencia);
-      if (!invoice) {
-        throw new ConversationFailure("not_found", `Fatura ${job.mesReferencia} nao encontrada`);
+      let invoiceText = await this.navigateUntilInvoiceList(representativeJob, currentText, [...pendingReferences]);
+
+      while (pendingReferences.size > 0) {
+        this.throwIfInvalidData(invoiceText);
+        const selected = this.selectPendingInvoice(group, invoiceText, pendingReferences);
+
+        if (!selected) {
+          this.markPendingReferencesAsNotFound(group, pendingReferences, results, "mes desejado nao localizado na lista atual");
+          await this.exitInvoiceSelectionWithoutDownload(group, [...pendingReferences]);
+          pendingReferences.clear();
+          break;
+        }
+
+        const { invoice, job } = selected;
+        lastDownloadedJob = job;
+        logger.info(
+          {
+            identificador: job.identificador,
+            codigoVenda: group.codigoVenda,
+            uc: group.uc,
+            option: invoice.option,
+            reference: invoice.reference,
+            mesesPendentes: [...pendingReferences]
+          },
+          "fatura selecionada no atendimento agrupado"
+        );
+        await this.client.sendMessage(invoice.option);
+
+        await this.navigateUntilPdfReady(job);
+        const targetPath = invoicePdfPathForJob(resolveProjectPath(env.OUTPUT_INVOICES_DIR), job);
+        logger.info({ identificador: job.identificador, mesReferencia: job.mesReferencia, arquivoPdf: targetPath }, "baixando pdf");
+        const download = await this.client.downloadLatestPdf(env.PDF_DOWNLOAD_TIMEOUT_MS).catch((error) => {
+          throw new ConversationFailure("download_error", error instanceof Error ? error.message : String(error));
+        });
+        const savedPath = typeof download === "string" ? this.moveDownloadedFile(download, targetPath) : await saveDownload(download, targetPath);
+        logger.info({ identificador: job.identificador, mesReferencia: job.mesReferencia, arquivoPdf: savedPath }, "pdf salvo");
+
+        downloadedReferences.add(invoice.reference);
+        pendingReferences.delete(invoice.reference);
+        group.mesesBaixados = [...downloadedReferences];
+        group.mesesPendentes = [...pendingReferences];
+        this.markReferenceResult(group, invoice.reference, results, { status: "success", arquivoPdf: savedPath });
+
+        const nextInvoiceText = await this.finishConversationWithGroupedFollowUp(group, [...pendingReferences]);
+        if (!nextInvoiceText) break;
+        invoiceText = this.handleGroupedFollowUpText(group, nextInvoiceText, pendingReferences, results);
       }
-      logger.info({ identificador: job.identificador, option: invoice.option, reference: invoice.reference }, "fatura selecionada");
-      await this.client.sendMessage(invoice.option);
 
-      await this.navigateUntilPdfReady(job);
-      const targetPath = invoicePdfPathForJob(resolveProjectPath(env.OUTPUT_INVOICES_DIR), job);
-      logger.info({ identificador: job.identificador, arquivoPdf: targetPath }, "baixando pdf");
-      const download = await this.client.downloadLatestPdf(env.PDF_DOWNLOAD_TIMEOUT_MS).catch((error) => {
-        throw new ConversationFailure("download_error", error instanceof Error ? error.message : String(error));
-      });
-      const savedPath = typeof download === "string" ? this.moveDownloadedFile(download, targetPath) : await saveDownload(download, targetPath);
-      logger.info({ identificador: job.identificador, arquivoPdf: savedPath }, "pdf salvo");
+      if (pendingReferences.size > 0) {
+        this.markPendingReferencesAsNotFound(group, pendingReferences, results, "sem nova lista para meses pendentes");
+      }
 
-      await this.finishConversation();
-      return { status: "success", arquivoPdf: savedPath };
+      await this.finishConversationWithFollowUp();
+      return { results: this.resultsForGroup(group, results) };
     } catch (error) {
       const status = this.statusFromError(error);
       const message = error instanceof Error ? error.message : String(error);
-      await this.resetConversationAfterFailure(status).catch((resetError) => {
-        logger.warn({ error: resetError, status }, "falha ao resetar conversa apos erro");
-      });
-      await this.saveErrorEvidence(job).catch((screenshotError) => {
+      if (!(error instanceof ConversationFailure && error.conversationClosed)) {
+        await this.resetConversationAfterFailure(status).catch((resetError) => {
+          logger.warn({ error: resetError, status }, "falha ao resetar conversa apos erro");
+        });
+      }
+      await this.saveErrorEvidence(lastDownloadedJob).catch((screenshotError) => {
         logger.warn({ error: screenshotError }, "falha ao salvar screenshot");
       });
-      return { status, erro: message };
+      for (const job of group.jobs) {
+        if (!results.has(job.id)) results.set(job.id, { status, erro: message });
+      }
+      return { results: this.resultsForGroup(group, results) };
     }
+  }
+
+  private groupFromSingleJob(job: InvoiceJob): InvoiceJobGroup {
+    return {
+      id: job.id,
+      codigoVenda: job.codigoVenda,
+      uc: job.uc || job.identificador,
+      identificador: job.identificador,
+      documento: job.cpfCnpj,
+      jobs: [job],
+      mesesDesejados: [job.mesReferencia],
+      mesesBaixados: [],
+      mesesPendentes: [job.mesReferencia]
+    };
+  }
+
+  private selectPendingInvoice(
+    group: InvoiceJobGroup,
+    invoiceText: string,
+    pendingReferences: Set<string>
+  ): { invoice: ParsedInvoice; job: InvoiceJob } | undefined {
+    const latestText = latestInvoiceSelectionBlock(invoiceText);
+    const invoices = parseInvoices(latestText);
+    const foundReferences = invoices.map((item) => item.reference);
+    const foundDesiredReferences = foundReferences.filter((reference) => group.mesesDesejados.includes(reference));
+    const missingReferences = [...pendingReferences].filter((reference) => !foundReferences.includes(reference));
+
+    logger.info(
+      {
+        codigoVenda: group.codigoVenda,
+        uc: group.uc,
+        mesesDesejados: group.mesesDesejados,
+        mesesBaixados: group.mesesBaixados,
+        mesesPendentes: [...pendingReferences],
+        mesesEncontrados: foundDesiredReferences,
+        mesesNaoLocalizadosNaLista: missingReferences,
+        faturasEncontradas: invoices.map((item) => ({
+          option: item.option,
+          reference: item.reference,
+          value: item.value,
+          dueDate: item.dueDate
+        }))
+      },
+      "comparando faturas exibidas com meses desejados"
+    );
+
+    for (const reference of group.mesesDesejados) {
+      if (!pendingReferences.has(reference)) continue;
+      const invoice = findInvoiceOption(latestText, reference);
+      if (!invoice) continue;
+      const job = group.jobs.find((item) => item.mesReferencia === reference);
+      if (!job) continue;
+      return { invoice, job };
+    }
+
+    return undefined;
+  }
+
+  private markReferenceResult(
+    group: InvoiceJobGroup,
+    reference: string,
+    results: Map<string, ConversationResult>,
+    result: ConversationResult
+  ): void {
+    for (const job of group.jobs) {
+      if (job.mesReferencia !== reference) continue;
+      if (results.has(job.id)) continue;
+      results.set(job.id, result);
+      logger.info(
+        {
+          id: job.id,
+          codigoVenda: job.codigoVenda,
+          uc: job.uc || job.identificador,
+          mesReferencia: reference,
+          status: result.status,
+          arquivoPdf: result.arquivoPdf,
+          erro: result.erro
+        },
+        "resultado do mes registrado"
+      );
+    }
+  }
+
+  private markPendingReferencesAsNotFound(
+    group: InvoiceJobGroup,
+    pendingReferences: Set<string>,
+    results: Map<string, ConversationResult>,
+    reason: string
+  ): void {
+    for (const reference of pendingReferences) {
+      logger.warn(
+        {
+          codigoVenda: group.codigoVenda,
+          uc: group.uc,
+          mesReferencia: reference,
+          reason
+        },
+        "mes desejado pendente nao localizado"
+      );
+      this.markReferenceResult(group, reference, results, {
+        status: "not_found",
+        erro: `Fatura ${reference} nao encontrada (${reason})`
+      });
+    }
+    group.mesesPendentes = [...pendingReferences];
+  }
+
+  private resultsForGroup(group: InvoiceJobGroup, results: Map<string, ConversationResult>): ConversationJobResult[] {
+    return group.jobs.map((job) => ({
+      job,
+      ...(results.get(job.id) ?? { status: "conversation_error", erro: "Resultado nao registrado" })
+    }));
   }
 
   private async wait(
@@ -188,6 +372,9 @@ export class CeeeConversationBot {
       ...documentDigitsRequestPatterns,
       ...invoiceListPatterns,
       ...invalidDataPatterns,
+      ...noOpenDebtsPatterns,
+      ...suspendedSupplyQuestionPatterns,
+      ...unsupportedSubjectPatterns,
       ...moreInvoiceQuestionPatterns,
       ...moreSubjectQuestionPatterns,
       ...ratingQuestionPatterns,
@@ -242,6 +429,10 @@ export class CeeeConversationBot {
 
       lastText = text;
       const intent = this.intentFromText(text);
+      if (intent === "unsupported_subject") {
+        return this.recoverFromUnsupportedSubject(state, text, true);
+      }
+
       if (intent !== "unknown") {
         logger.info({ state, attempt, intent, text: text.slice(-1200) }, "estado reconhecido apos recuperacao");
         return text;
@@ -256,18 +447,43 @@ export class CeeeConversationBot {
     );
   }
 
-  private async navigateUntilInvoiceList(job: InvoiceJob, initialText: string): Promise<string> {
+  private async navigateUntilInvoiceList(job: InvoiceJob, initialText: string, targetReferences = [job.mesReferencia]): Promise<string> {
     let currentText = initialText;
     const startedAt = Date.now();
     let consentAnswered = false;
     let identifierSent = false;
+    let cpfIdentifierSent = false;
     let accountConfirmed = false;
     let invoiceServiceSelected = false;
 
     while (Date.now() - startedAt < env.BOT_STEP_TIMEOUT_MS * 4) {
       this.throwIfInvalidData(currentText);
+      if (matchesAny(currentText, noOpenDebtsPatterns)) {
+        await this.handleNoOpenDebts(job, currentText);
+      }
+
       const intent = this.intentFromText(currentText);
       logger.info({ identificador: job.identificador, intent }, "estado da conversa identificado");
+
+      if (intent === "suspended_supply_question") {
+        await this.answerOtherSubjectForSuspendedSupply(job);
+        currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_SUSPENDED_SUPPLY_OTHER_SUBJECT", [
+          ...invoiceServicePatterns,
+          ...moreSubjectQuestionPatterns,
+          ...ratingQuestionPatterns,
+          ...donePatterns,
+          ...finalGoodbyePatterns,
+          ...invalidDataPatterns
+        ], {
+          requireVisibleTextChange: true
+        });
+        continue;
+      }
+
+      if (intent === "unsupported_subject") {
+        currentText = await this.recoverFromUnsupportedSubject("UNSUPPORTED_SUBJECT_BEFORE_INVOICE_LIST", currentText);
+        continue;
+      }
 
       if (intent === "consent_request") {
         if (consentAnswered) {
@@ -295,11 +511,55 @@ export class CeeeConversationBot {
       }
 
       if (intent === "identifier_request") {
+        if (identifierSent && !cpfIdentifierSent && matchesAny(currentText, identifierRejectedPatterns)) {
+          logger.info(
+            {
+              identificador: job.identificador,
+              cpfCnpjMascarado: maskDocument(job.cpfCnpj)
+            },
+            "UC nao reconhecida; tentando CPF/CNPJ como identificador"
+          );
+          await this.client.sendMessage(job.cpfCnpj);
+          cpfIdentifierSent = true;
+          currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_CPF_IDENTIFIER", [
+            ...accountConfirmationPatterns,
+            ...invoiceServicePatterns,
+            ...invoiceListPatterns,
+            ...identifierRequestPatterns,
+            ...identifierRejectedPatterns,
+            ...noOpenDebtsPatterns,
+            ...suspendedSupplyQuestionPatterns,
+            ...invalidDataPatterns
+          ], {
+            requireVisibleTextChange: true
+          });
+          continue;
+        }
+
+        if (identifierSent && cpfIdentifierSent && matchesAny(currentText, identifierRejectedPatterns)) {
+          logger.warn(
+            {
+              identificador: job.identificador,
+              cpfCnpjMascarado: maskDocument(job.cpfCnpj),
+              tentativasIdentificacao: ["UC", "CPF/CNPJ"]
+            },
+            "UC e CPF/CNPJ nao reconhecidos; encerrando atendimento e seguindo para proxima linha"
+          );
+          throw new ConversationFailure(
+            "invalid_data",
+            "UC e CPF/CNPJ nao localizados pelo bot da CEEE; tentativas realizadas e atendimento encerrado"
+          );
+        }
+
         if (identifierSent) {
           currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_REPEATED_IDENTIFIER_REQUEST", [
             ...accountConfirmationPatterns,
             ...invoiceServicePatterns,
             ...invoiceListPatterns,
+            ...identifierRequestPatterns,
+            ...identifierRejectedPatterns,
+            ...noOpenDebtsPatterns,
+            ...suspendedSupplyQuestionPatterns,
             ...invalidDataPatterns
           ], {
             requireVisibleTextChange: true
@@ -312,6 +572,9 @@ export class CeeeConversationBot {
           ...accountConfirmationPatterns,
           ...invoiceServicePatterns,
           ...invoiceListPatterns,
+          ...identifierRequestPatterns,
+          ...identifierRejectedPatterns,
+          ...suspendedSupplyQuestionPatterns,
           ...invalidDataPatterns
         ], {
           requireVisibleTextChange: true
@@ -324,6 +587,8 @@ export class CeeeConversationBot {
           currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_REPEATED_ACCOUNT_CONFIRMATION", [
             ...invoiceServicePatterns,
             ...invoiceListPatterns,
+            ...noOpenDebtsPatterns,
+            ...suspendedSupplyQuestionPatterns,
             ...invalidDataPatterns
           ], {
             requireVisibleTextChange: true
@@ -334,11 +599,13 @@ export class CeeeConversationBot {
         await this.client.sendOption(["Confirmo"], "Confirmo");
         accountConfirmed = true;
         currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_ACCOUNT_CONFIRMATION", [
-          ...invoiceServicePatterns,
-          ...invoiceListPatterns,
-          ...invalidDataPatterns
-        ], {
-          requireVisibleTextChange: true
+            ...invoiceServicePatterns,
+            ...invoiceListPatterns,
+            ...noOpenDebtsPatterns,
+            ...suspendedSupplyQuestionPatterns,
+            ...invalidDataPatterns
+          ], {
+            requireVisibleTextChange: true
         });
         continue;
       }
@@ -349,6 +616,11 @@ export class CeeeConversationBot {
             ...invoiceListPatterns,
             ...documentDigitsRequestPatterns,
             ...documentDigitsInvalidPatterns,
+            ...noOpenDebtsPatterns,
+            ...moreSubjectQuestionPatterns,
+            ...ratingQuestionPatterns,
+            ...donePatterns,
+            ...finalGoodbyePatterns,
             ...invalidDataPatterns
           ], {
             visibleTextSelector: latestInvoiceSelectionBlock,
@@ -356,15 +628,24 @@ export class CeeeConversationBot {
           });
           continue;
         }
-        await this.client.sendOption(
-          ["Segunda via Fatura", "Segunda via de Fatura"],
-          "Segunda via Fatura"
-        );
+        if (isGeneralServicesMenu(currentText)) {
+          await this.client.sendMessage("Segunda via de Fatura");
+        } else {
+          await this.client.sendOption(
+            ["Segunda via Fatura", "Segunda via de Fatura"],
+            "Segunda via de Fatura"
+          );
+        }
         invoiceServiceSelected = true;
         currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_INVOICE_SERVICE", [
           ...invoiceListPatterns,
           ...documentDigitsRequestPatterns,
           ...documentDigitsInvalidPatterns,
+          ...noOpenDebtsPatterns,
+          ...moreSubjectQuestionPatterns,
+          ...ratingQuestionPatterns,
+          ...donePatterns,
+          ...finalGoodbyePatterns,
           ...invalidDataPatterns
         ], {
           visibleTextSelector: latestInvoiceSelectionBlock,
@@ -374,14 +655,35 @@ export class CeeeConversationBot {
       }
 
       if (intent === "document_digits_request" || intent === "document_digits_invalid") {
-        return this.sendLastDigitsAndWaitForInvoices(job);
+        return this.sendLastDigitsAndWaitForInvoices(job, targetReferences);
       }
 
       if (intent === "invoice_list") {
-        return this.waitForInvoiceListMatchingReference(job, currentText);
+        return this.waitForInvoiceListMatchingReferences(job, currentText, targetReferences);
       }
 
-      if (intent === "more_invoice_question" || intent === "more_subject_question" || intent === "rating_question" || intent === "done") {
+      if (
+        invoiceServiceSelected &&
+        (intent === "more_subject_question" || intent === "rating_question" || intent === "done")
+      ) {
+        await this.finishUnavailableInvoiceConversation(job, currentText);
+      }
+
+      if (intent === "more_subject_question") {
+        logger.info(
+          { identificador: job.identificador },
+          "pergunta de outro assunto encontrada antes da lista; respondendo nao antes de reiniciar"
+        );
+        await this.answerNoAtConversationEnd("pergunta sobre outro assunto antes de reiniciar atendimento");
+        await this.finishConversationWithFollowUp({ answeredMoreSubject: true });
+        await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
+        currentText = await this.waitForAnyKnownState("WAITING_STATE_AFTER_RESTART_FROM_MORE_SUBJECT_ANSWERED_NO", {
+          requireVisibleTextChange: true
+        });
+        continue;
+      }
+
+      if (intent === "more_invoice_question" || intent === "rating_question" || intent === "done") {
         await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
         currentText = await this.waitForAnyKnownState("WAITING_STATE_AFTER_RESTART_FROM_FINISHED_CONVERSATION", {
           requireVisibleTextChange: true
@@ -496,6 +798,11 @@ export class CeeeConversationBot {
       });
 
       lastText = options.visibleTextSelector?.(text) ?? text;
+      if (lastText.trim() && matchesAny(lastText, moreSubjectQuestionPatterns)) return lastText;
+      if (matchesAny(lastText, unsupportedSubjectPatterns)) {
+        return this.recoverFromUnsupportedSubject(state, lastText);
+      }
+
       if (lastText.trim() && matchesAny(lastText, patterns)) return lastText;
       if (isTransitionOnlyText(lastText)) {
         logger.info({ state, text: lastText.slice(-500) }, "mensagem intermediaria da CEEE; aguardando proxima etapa");
@@ -550,6 +857,46 @@ export class CeeeConversationBot {
     }
   }
 
+  private async handleNoOpenDebts(job: InvoiceJob, text: string): Promise<never> {
+    logger.info(
+      {
+        identificador: job.identificador,
+        referenciaProcurada: job.mesReferencia,
+        text: text.slice(-500)
+      },
+      "CEEE informou que nao ha debitos faturados em aberto"
+    );
+    return this.finishUnavailableInvoiceConversation(job, text);
+  }
+
+  private async finishUnavailableInvoiceConversation(job: InvoiceJob, text: string): Promise<never> {
+    const askedMoreSubject = matchesAny(text, moreSubjectQuestionPatterns);
+    if (askedMoreSubject) {
+      await this.answerNoAtConversationEnd("pergunta sobre outro assunto sem fatura disponivel");
+    }
+
+    await this.finishConversationWithFollowUp();
+
+    if (askedMoreSubject) {
+      await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE).catch(() => {});
+    }
+    // If we started a new conversation above, try to confirm consent so the next job won't time out
+    if (askedMoreSubject) {
+      try {
+        const initial = await this.waitInitialResponseAfterHello();
+        const intent = this.intentFromText(initial);
+        if (intent === "consent_request") {
+          await this.client.sendOption(["Sim, Clara!", "Sim"], "Sim, Clara!").catch(() => {});
+        }
+      } catch (error) {
+        // ignore errors here, we'll still close current job
+        logger.warn({ error, identificador: job.identificador }, "nao confirmou consentimento apos reiniciar conversa");
+      }
+    }
+
+    throw new ConversationFailure("not_found", `Fatura ${job.mesReferencia} nao encontrada`);
+  }
+
   private logHolderDivergence(job: InvoiceJob, text: string): void {
     if (!job.nomeTitular) return;
     const expected = normalizeText(job.nomeTitular);
@@ -558,8 +905,21 @@ export class CeeeConversationBot {
     }
   }
 
-  private async sendLastDigitsAndWaitForInvoices(job: InvoiceJob): Promise<string> {
-    await this.client.sendMessage(job.documentLastDigits);
+  private async sendLastDigitsAndWaitForInvoices(job: InvoiceJob, targetReferences = [job.mesReferencia]): Promise<string> {
+    // Analisa a mensagem do CEEE para determinar se está pedindo 4 primeiros ou 4 últimos
+    const recentText = await this.client.getRecentIncomingText().catch(() => "");
+    const digitsToSend = isPedindoUltimos(recentText) ? job.cpfUltimos4 : job.cpfPrimeiros4;
+    
+    logger.info(
+      {
+        identificador: job.identificador,
+        pedindoUltimos: isPedindoUltimos(recentText),
+        digitsToSend
+      },
+      "enviando dígitos do CPF"
+    );
+    
+    await this.client.sendMessage(digitsToSend);
     const invoiceText = await this.wait("WAITING_OPEN_INVOICES_LIST", [
       ...invoiceListPatterns,
       ...invalidDataPatterns
@@ -568,11 +928,11 @@ export class CeeeConversationBot {
       visibleTextSelector: latestInvoiceSelectionBlock,
       requireVisibleTextChange: true
     });
-    return this.waitForInvoiceListMatchingReference(job, invoiceText);
+    return this.waitForInvoiceListMatchingReferences(job, invoiceText, targetReferences);
   }
 
   private async navigateUntilPdfReady(job: InvoiceJob): Promise<void> {
-    let currentText = await this.waitForAnyKnownState("WAITING_STATE_AFTER_INVOICE_SELECTION");
+    let currentText = await this.waitForPostInvoiceSelectionState("WAITING_STATE_AFTER_INVOICE_SELECTION");
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < env.BOT_STEP_TIMEOUT_MS * 3) {
@@ -580,8 +940,13 @@ export class CeeeConversationBot {
       const intent = this.intentFromText(currentText);
       logger.info({ identificador: job.identificador, intent }, "estado pos-selecao identificado");
 
+      if (intent === "unsupported_subject") {
+        currentText = await this.recoverFromUnsupportedSubject("UNSUPPORTED_SUBJECT_BEFORE_PDF", currentText);
+        continue;
+      }
+
       if (intent === "payment_method") {
-        await this.client.sendMessage("2");
+        await this.answerPaymentMethod(currentText);
         currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_PAYMENT_METHOD", [
           ...documentDigitsRequestPatterns,
           ...documentDigitsInvalidPatterns,
@@ -600,59 +965,234 @@ export class CeeeConversationBot {
 
       if (intent === "pdf_ready") return;
 
-      currentText = await this.probeAndWaitKnownState("WAITING_RECOGNIZABLE_STATE_BEFORE_PDF");
+      if (intent === "invoice_list") {
+        logger.info(
+          { identificador: job.identificador, text: currentText.slice(-500) },
+          "lista de faturas antiga ignorada apos selecao; aguardando forma de pagamento"
+        );
+      }
+
+      currentText = await this.waitForPostInvoiceSelectionState("WAITING_RECOGNIZABLE_STATE_BEFORE_PDF");
     }
 
     throw new ConversationFailure("timeout", "Timeout ao navegar ate o PDF");
+  }
+
+  private async waitForPostInvoiceSelectionState(state: string): Promise<string> {
+    return this.waitForNextActionableState(state, [
+      ...paymentMethodPatterns,
+      ...documentDigitsRequestPatterns,
+      ...documentDigitsInvalidPatterns,
+      ...pdfReadyPatterns,
+      ...invalidDataPatterns
+    ], {
+      requireVisibleTextChange: true
+    });
   }
 
   private async sendDocumentDigitsUntilAccepted(job: InvoiceJob): Promise<void> {
     const maxAttempts = 3;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      logger.info({ identificador: job.identificador, attempt }, "enviando digitos do documento");
-      await this.client.sendMessage(job.documentLastDigits);
+      // Analisa a mensagem do CEEE para determinar se está pedindo 4 primeiros ou 4 últimos
+      const recentText = await this.client.getRecentIncomingText().catch(() => "");
+      
+      // Verifica se está pedindo data de nascimento
+      if (isPedindoDataDeNascimento(recentText)) {
+        if (!job.dataDeNascimento || job.dataDeNascimento === "0") {
+          logger.warn(
+            {
+              identificador: job.identificador,
+              attempt,
+              dataDeNascimento: job.dataDeNascimento
+            },
+            "data de nascimento indisponivel; encerrando tentativa"
+          );
+          await this.client.sendMessage("Sair");
+          throw new ConversationFailure(
+            "invalid_data",
+            "data_de_nascimento indisponivel"
+          );
+        }
+
+        logger.info(
+          {
+            identificador: job.identificador,
+            attempt,
+            dataDeNascimento: job.dataDeNascimento
+          },
+          "enviando data de nascimento"
+        );
+        
+        await this.client.sendMessage(job.dataDeNascimento);
+        const response = await this.wait("WAITING_PDF_OR_DATE_RETRY", [
+          ...documentDigitsInvalidPatterns,
+          ...birthDateRequestPatterns,
+          ...rgDigitsRequestPatterns,
+          ...pdfReadyPatterns,
+          ...moreInvoiceQuestionPatterns,
+          ...invalidDataPatterns,
+          ...unsupportedSubjectPatterns
+        ], {
+          includeVisibleTextFallback: true,
+          requireVisibleTextChange: true,
+          timeoutMs: Math.max(env.BOT_STEP_TIMEOUT_MS, 90_000)
+        });
+
+        // Se o CEEE pedir RG, envia "Sair" e encerra
+        if (isPedindoRg(response)) {
+          await this.finishRgRequiredConversation(job, attempt);
+        }
+
+        // Se data foi recusada, tenta novamente
+        if (matchesAny(response, [...documentDigitsInvalidPatterns, ...birthDateRequestPatterns])) {
+          logger.warn(
+            {
+              identificador: job.identificador,
+              attempt,
+              response: response.slice(-500)
+            },
+            "data de nascimento recusada"
+          );
+          continue;
+        }
+
+        // Se conseguiu prosseguir, retorna
+        if (matchesAny(response, [...pdfReadyPatterns, ...moreInvoiceQuestionPatterns])) return;
+        if (isPdfReferenceCaption(response, job.mesReferencia)) {
+          logger.info(
+            { identificador: job.identificador, reference: job.mesReferencia },
+            "referencia da fatura recebida como legenda do PDF; seguindo para download"
+          );
+          return;
+        }
+        continue;
+      }
+
+      // Envio dos dígitos do CPF normalmente
+      const digitsToSend = isPedindoUltimos(recentText) ? job.cpfUltimos4 : job.cpfPrimeiros4;
+      
+      logger.info(
+        {
+          identificador: job.identificador,
+          attempt,
+          pedindoUltimos: isPedindoUltimos(recentText),
+          digitsToSend
+        },
+        "enviando digitos do documento"
+      );
+      
+      await this.client.sendMessage(digitsToSend);
       const response = await this.wait("WAITING_PDF_OR_DIGITS_RETRY", [
-        ...documentDigitsRequestPatterns,
         ...documentDigitsInvalidPatterns,
-        ...pdfReadyPatterns
+        ...birthDateRequestPatterns,
+        ...pdfReadyPatterns,
+        ...moreInvoiceQuestionPatterns,
+        ...invalidDataPatterns,
+        ...unsupportedSubjectPatterns
       ], {
         includeVisibleTextFallback: true,
-        requireVisibleTextChange: true
+        requireVisibleTextChange: true,
+        timeoutMs: Math.max(env.BOT_STEP_TIMEOUT_MS, 90_000)
       });
 
-      if (matchesAny(response, pdfReadyPatterns)) return;
-      if (matchesAny(response, [...documentDigitsInvalidPatterns, ...documentDigitsRequestPatterns])) {
+      if (matchesAny(response, unsupportedSubjectPatterns)) {
+        const recoveredText = await this.recoverFromUnsupportedSubject("UNSUPPORTED_SUBJECT_AFTER_DOCUMENT_DIGITS", response);
+        if (matchesAny(recoveredText, [...pdfReadyPatterns, ...moreInvoiceQuestionPatterns])) return;
+        throw new ConversationFailure(
+          "conversation_error",
+          `CEEE saiu do fluxo apos os digitos do documento. Estado recuperado: ${this.intentFromText(recoveredText)}`
+        );
+      }
+      if (matchesAny(response, [...pdfReadyPatterns, ...moreInvoiceQuestionPatterns])) return;
+      if (isPdfReferenceCaption(response, job.mesReferencia)) {
+        logger.info(
+          { identificador: job.identificador, reference: job.mesReferencia },
+          "referencia da fatura recebida como legenda do PDF; seguindo para download"
+        );
+        return;
+      }
+      // Se está pedindo data de nascimento, tenta no próximo loop
+      if (isPedindoDataDeNascimento(response)) {
+        logger.info(
+          { identificador: job.identificador, attempt },
+          "CEEE pedindo data de nascimento; tentando próxima validação"
+        );
+        continue;
+      }
+      if (matchesAny(response, documentDigitsInvalidPatterns)) {
         logger.warn(
           {
             identificador: job.identificador,
             attempt,
             response: response.slice(-500)
           },
-          "digitos do documento recusados ou solicitados novamente"
+          "digitos do documento recusados"
         );
         continue;
       }
+
+      throw new ConversationFailure(
+        "timeout",
+        `Nao foi possivel confirmar entrega do PDF apos os digitos. Ultima mensagem: ${response.slice(-500)}`
+      );
     }
 
     await this.client.sendMessage("Sair");
     throw new ConversationFailure("invalid_data", "Digitos do CPF/CNPJ recusados apos 3 tentativas");
   }
 
-  private async waitForInvoiceListMatchingReference(job: InvoiceJob, initialText: string): Promise<string> {
+  private async finishRgRequiredConversation(job: InvoiceJob, attempt: number): Promise<never> {
+    logger.warn(
+      {
+        identificador: job.identificador,
+        mesReferencia: job.mesReferencia,
+        attempt,
+        rgSolicitado: true
+      },
+      "CEEE solicitou RG indisponivel; enviando Sair e encerrando atendimento"
+    );
+
+    await this.client.sendMessage("Sair");
+    await this.finishConversationWithFollowUp();
+    throw new ConversationFailure(
+      "invalid_data",
+      "RG solicitado pela CEEE; informacao indisponivel, atendimento finalizado com Nao",
+      true
+    );
+  }
+
+  private async waitForInvoiceListMatchingReferences(job: InvoiceJob, initialText: string, targetReferences: string[]): Promise<string> {
     const startedAt = Date.now();
     let latestText = latestInvoiceSelectionBlock(initialText);
     let latestInvoices = parseInvoices(latestText);
 
     while (Date.now() - startedAt < env.BOT_STEP_TIMEOUT_MS) {
-      if (findInvoiceOption(latestText, job.mesReferencia)) return latestText;
+      if (targetReferences.some((reference) => findInvoiceOption(latestText, reference))) return latestText;
+      if (latestInvoices.length > 0) {
+        logger.warn(
+          {
+            identificador: job.identificador,
+            referenciasProcuradas: targetReferences,
+            faturasEncontradas: latestInvoices.map((item) => ({
+              option: item.option,
+              reference: item.reference,
+              value: item.value,
+              dueDate: item.dueDate
+            }))
+          },
+          "referencia nao encontrada na lista atual; encerrando atendimento"
+        );
+        return latestText;
+      }
 
       const visibleText = latestInvoiceSelectionBlock(await this.client.getVisibleText());
       const visibleInvoices = parseInvoices(visibleText);
       if (visibleInvoices.length > 0) {
         latestText = visibleText;
         latestInvoices = visibleInvoices;
-        if (findInvoiceOption(latestText, job.mesReferencia)) return latestText;
+        if (targetReferences.some((reference) => findInvoiceOption(latestText, reference))) return latestText;
+        return latestText;
       }
 
       await delay(1000);
@@ -661,7 +1201,7 @@ export class CeeeConversationBot {
     logger.warn(
       {
         identificador: job.identificador,
-        referenciaProcurada: job.mesReferencia,
+        referenciasProcuradas: targetReferences,
         faturasEncontradas: latestInvoices.map((item) => ({
           option: item.option,
           reference: item.reference,
@@ -738,11 +1278,11 @@ export class CeeeConversationBot {
     }
   }
 
-  private async finishConversationWithFollowUp(): Promise<void> {
+  private async finishConversationWithFollowUp(initialState: { answeredMoreSubject?: boolean } = {}): Promise<void> {
     const startedAt = Date.now();
     let answeredPix = false;
     let answeredMoreInvoice = false;
-    let answeredMoreSubject = false;
+    let answeredMoreSubject = initialState.answeredMoreSubject ?? false;
     let answeredRating = false;
 
     while (Date.now() - startedAt < 90000) {
@@ -753,7 +1293,8 @@ export class CeeeConversationBot {
             ...moreInvoiceQuestionPatterns,
             ...moreSubjectQuestionPatterns,
             ...ratingQuestionPatterns,
-            ...donePatterns
+            ...donePatterns,
+            ...finalGoodbyePatterns
           ],
           10000,
           { includeVisibleTextFallback: true }
@@ -785,9 +1326,244 @@ export class CeeeConversationBot {
         continue;
       }
 
-      if (matchesAny(text, donePatterns)) return;
+      if (answeredMoreSubject && matchesAny(text, moreSubjectQuestionPatterns)) {
+        await delay(1000);
+        continue;
+      }
+
+      if (matchesAny(text, [...donePatterns, ...finalGoodbyePatterns])) return;
+      if (matchesAny(text, unsupportedSubjectPatterns)) {
+        logger.info({ text: text.slice(-500) }, "assunto nao suportado no fim da conversa; encerrando fluxo final");
+        return;
+      }
       if (answeredRating) return;
     }
+  }
+
+  private async finishConversationWithGroupedFollowUp(
+    group: InvoiceJobGroup,
+    pendingReferences: string[]
+  ): Promise<string | undefined> {
+    const startedAt = Date.now();
+    let answeredPix = false;
+    let answeredMoreInvoice = false;
+    let answeredMoreSubject = false;
+    let answeredRating = false;
+
+    while (Date.now() - startedAt < 90000) {
+      const text = await this.client
+        .waitForMessageMatching(
+          [
+            ...pixQuestionPatterns,
+            ...moreInvoiceQuestionPatterns,
+            ...moreSubjectQuestionPatterns,
+            ...ratingQuestionPatterns,
+            ...donePatterns,
+            ...finalGoodbyePatterns
+          ],
+          10000,
+          { includeVisibleTextFallback: true }
+        )
+        .catch(async () => this.client.getVisibleText().catch(() => ""));
+
+      if (!answeredPix && matchesAny(text, pixQuestionPatterns)) {
+        answeredPix = true;
+        await this.answerNoAtConversationEnd("pergunta sobre pix");
+        continue;
+      }
+
+      if (!answeredMoreInvoice && matchesAny(text, moreInvoiceQuestionPatterns)) {
+        answeredMoreInvoice = true;
+        if (pendingReferences.length > 0) {
+          logger.info(
+            {
+              codigoVenda: group.codigoVenda,
+              uc: group.uc,
+              mesesPendentes: pendingReferences,
+              resposta: "Sim"
+            },
+            "respondendo pergunta sobre outra conta"
+          );
+          await this.answerYesAtConversationEnd("ainda existem meses desejados pendentes");
+          return this.waitForNextActionableState("WAITING_INVOICE_LIST_AFTER_MORE_INVOICE_YES", [
+            ...invoiceListPatterns,
+            ...noOpenDebtsPatterns,
+            ...moreSubjectQuestionPatterns,
+            ...ratingQuestionPatterns,
+            ...donePatterns,
+            ...finalGoodbyePatterns,
+            ...invalidDataPatterns
+          ], {
+            visibleTextSelector: latestInvoiceSelectionBlock,
+            requireVisibleTextChange: true,
+            timeoutMs: Math.max(env.BOT_STEP_TIMEOUT_MS, 90_000)
+          });
+        }
+
+        logger.info(
+          {
+            codigoVenda: group.codigoVenda,
+            uc: group.uc,
+            mesesPendentes: pendingReferences,
+            resposta: "Nao"
+          },
+          "respondendo pergunta sobre outra conta"
+        );
+        await this.answerNoAtConversationEnd("sem meses desejados pendentes");
+        continue;
+      }
+
+      if (!answeredMoreSubject && matchesAny(text, moreSubjectQuestionPatterns)) {
+        answeredMoreSubject = true;
+        await this.answerNoAtConversationEnd("pergunta sobre outro assunto");
+        continue;
+      }
+
+      if (!answeredRating && matchesAny(text, ratingQuestionPatterns)) {
+        answeredRating = true;
+        logger.info({ rating: env.DEFAULT_RATING }, "respondendo avaliacao final");
+        await this.client.sendMessage(env.DEFAULT_RATING);
+        continue;
+      }
+
+      if (matchesAny(text, [...donePatterns, ...finalGoodbyePatterns])) return undefined;
+      if (matchesAny(text, unsupportedSubjectPatterns)) {
+        logger.info({ text: text.slice(-500) }, "assunto nao suportado no fim da conversa agrupada");
+        return undefined;
+      }
+      if (answeredRating) return undefined;
+    }
+
+    return undefined;
+  }
+
+  private handleGroupedFollowUpText(
+    group: InvoiceJobGroup,
+    text: string,
+    pendingReferences: Set<string>,
+    results: Map<string, ConversationResult>
+  ): string {
+    if (matchesAny(text, noOpenDebtsPatterns)) {
+      this.markPendingReferencesAsNotFound(group, pendingReferences, results, "CEEE informou que nao ha debitos em aberto");
+      pendingReferences.clear();
+      return text;
+    }
+
+    if (matchesAny(text, invoiceListPatterns)) return text;
+
+    this.markPendingReferencesAsNotFound(group, pendingReferences, results, "CEEE nao apresentou nova lista de faturas");
+    pendingReferences.clear();
+    return text;
+  }
+
+  private async recoverFromUnsupportedSubject(state: string, text: string, alreadyProbed = false): Promise<string> {
+    if (matchesAny(text, moreSubjectQuestionPatterns)) {
+      logger.info(
+        { state, text: text.slice(-500) },
+        "mensagem do site da Equatorial contem pergunta de outro assunto; seguindo para responder nao"
+      );
+      return text;
+    }
+
+    logger.warn(
+      { state, text: text.slice(-500), alreadyProbed },
+      "CEEE informou assunto fora do fluxo; tentando localizar etapa com ponto"
+    );
+
+    if (alreadyProbed) {
+      await this.exitUnsupportedSubjectFlow(state, text);
+    }
+
+    await this.client.sendMessage(".");
+    const response = await this.client
+      .waitForMessageMatching(this.allConversationStatePatterns(), UNSUPPORTED_SUBJECT_PROBE_TIMEOUT_MS, {
+        includeVisibleTextFallback: true,
+        requireVisibleTextChange: true
+      })
+      .catch(async (error) => {
+        if (!(error instanceof Error) || error.message !== "timeout") throw error;
+        return this.client.getRecentIncomingText().catch(() => "");
+      });
+
+    const intent = this.intentFromText(response);
+    if (intent === "unsupported_subject") {
+      await this.exitUnsupportedSubjectFlow(state, response);
+    }
+
+    if (intent === "unknown") {
+      throw new ConversationFailure(
+        "timeout",
+        `Nao foi possivel localizar etapa apos ponto em ${state}. Ultima mensagem: ${response.slice(-500)}`
+      );
+    }
+
+    logger.info({ state, intent, text: response.slice(-1200) }, "estado reconhecido apos ponto de localizacao");
+    return response;
+  }
+
+  private async exitUnsupportedSubjectFlow(state: string, text: string): Promise<never> {
+    logger.warn(
+      { state, text: text.slice(-500) },
+      "CEEE repetiu mensagem de assunto fora do fluxo; encerrando para reiniciar a mesma linha"
+    );
+    await this.client.sendMessage("Sair");
+    await this.waitForExitAcknowledgement().catch((error) => {
+      logger.warn({ error, state }, "nao confirmou encerramento apos assunto fora do fluxo");
+    });
+    await delay(3000);
+    throw new ConversationFailure("conversation_error", "CEEE saiu do fluxo; atendimento reiniciado para a mesma linha do CSV");
+  }
+
+  private async exitInvoiceSelectionWithoutDownload(group: InvoiceJobGroup, pendingReferences: string[]): Promise<void> {
+    logger.info(
+      {
+        codigoVenda: group.codigoVenda,
+        uc: group.uc,
+        mesesPendentes: pendingReferences
+      },
+      "encerrando selecao de faturas sem baixar duplicadas"
+    );
+    await this.client.sendMessage("Sair");
+    await this.waitForExitAcknowledgement().catch((error) => {
+      logger.warn({ error, codigoVenda: group.codigoVenda, uc: group.uc }, "nao confirmou encerramento apos lista sem meses desejados");
+    });
+    await delay(3000);
+  }
+
+  private async answerYesAtConversationEnd(reason: string): Promise<void> {
+    logger.info({ reason }, "respondendo sim no encerramento");
+    await this.client.sendOption(["Sim"], "Sim").catch(async (error) => {
+      logger.warn({ error, reason }, "opcao sim do encerramento nao encontrada; enviando fallback textual");
+      await this.client.sendMessage("Sim");
+    });
+  }
+
+  private async answerPaymentMethod(text: string): Promise<void> {
+    if (isPaymentButtonMenu(text)) {
+      logger.info({ resposta: "Pagar boleto" }, "respondendo forma de pagamento por boleto");
+      await this.client.sendOption(["Pagar boleto", "Pagar com boleto"], "Pagar boleto").catch(async (error) => {
+        logger.warn({ error }, "opcao pagar boleto nao encontrada; enviando fallback textual");
+        await this.client.sendMessage("Pagar boleto");
+      });
+      return;
+    }
+
+    logger.info({ resposta: "2" }, "respondendo forma de pagamento por opcao numerica");
+    await this.client.sendMessage("2");
+  }
+
+  private async answerOtherSubjectForSuspendedSupply(job: InvoiceJob): Promise<void> {
+    logger.info(
+      {
+        identificador: job.identificador,
+        resposta: "Outro assunto"
+      },
+      "fornecimento suspenso informado; selecionando outro assunto"
+    );
+    await this.client.sendOption(["Outro assunto"], "Outro assunto").catch(async (error) => {
+      logger.warn({ error, identificador: job.identificador }, "opcao outro assunto nao encontrada; enviando fallback textual");
+      await this.client.sendMessage("Outro assunto");
+    });
   }
 
   private async answerNoAtConversationEnd(reason: string): Promise<void> {
@@ -820,5 +1596,26 @@ function isTransitionOnlyText(text: string): boolean {
     /consulto o nosso sistema/.test(normalized) ||
     /gero seu protocolo/.test(normalized) ||
     /vamos continuar nossa conversa/.test(normalized)
+  );
+}
+
+function isPdfReferenceCaption(text: string, reference: string): boolean {
+  const normalized = normalizeText(text)
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return normalized.some((line) => line === reference);
+}
+
+function isGeneralServicesMenu(text: string): boolean {
+  const normalized = normalizeText(text);
+  return /sobre o que voce gostaria de falar hoje/.test(normalized) && /segunda via de fatura/.test(normalized);
+}
+
+function isPaymentButtonMenu(text: string): boolean {
+  const normalized = normalizeText(text);
+  return (
+    /posso te enviar essa conta por aqui/.test(normalized) ||
+    (/como prefere/.test(normalized) && /pagar boleto/.test(normalized))
   );
 }

@@ -48,6 +48,8 @@ export class EvolutionApiClient implements ConversationClient {
   private remoteJid = "";
   private remoteJids = new Set<string>();
   private seenMessageIds = new Set<string>();
+  private initialIncomingMessageIds = new Set<string>();
+  private lastOutboundIncomingMessageIds = new Set<string>();
   private answeredInteractiveMessageIds = new Set<string>();
   private latestMessages: EvolutionMessage[] = [];
   private lastOutboundAt = 0;
@@ -88,15 +90,19 @@ export class EvolutionApiClient implements ConversationClient {
     this.remoteJid = `${this.contactNumber}@s.whatsapp.net`;
     this.remoteJids = new Set([this.remoteJid]);
     this.answeredInteractiveMessageIds.clear();
+    this.lastOutboundAt = 0;
     const messages = await this.fetchMessages();
+    const incomingIds = messages.filter((message) => !message.fromMe).map((message) => message.id);
     this.latestMessages = messages;
     this.seenMessageIds = new Set(messages.map((message) => message.id));
+    this.initialIncomingMessageIds = new Set(incomingIds);
+    this.lastOutboundIncomingMessageIds = new Set(incomingIds);
   }
 
   async sendMessage(text: string): Promise<void> {
     if (!this.contactNumber) throw new Error("Conversa nao foi aberta antes do envio");
     await delay(this.actionDelayMs);
-    this.lastOutboundAt = Date.now();
+    this.markOutboundCheckpoint();
     await this.request("POST", `/message/sendText/${encodeURIComponent(this.instance)}`, {
       number: this.contactNumber,
       text,
@@ -108,7 +114,7 @@ export class EvolutionApiClient implements ConversationClient {
   async sendOption(labels: string[], fallback: string): Promise<void> {
     const incoming = await this.fetchIncomingMessages();
     const candidateMessages = this.messagesAfterLastOutbound(incoming);
-    const searchableMessages = candidateMessages.length > 0 ? candidateMessages : incoming;
+    const searchableMessages = candidateMessages;
     const menuMessage = [...searchableMessages]
       .reverse()
       .find((message) => message.interactiveOptions.length > 0 && !this.answeredInteractiveMessageIds.has(message.id));
@@ -123,9 +129,9 @@ export class EvolutionApiClient implements ConversationClient {
     }
 
     if (!menuMessage || !selected) {
-      const alreadyAnswered = [...searchableMessages]
-        .reverse()
-        .find((message) => message.interactiveOptions.length > 0 && this.answeredInteractiveMessageIds.has(message.id));
+      const alreadyAnswered = [...searchableMessages].reverse().find((message) => {
+        return message.interactiveOptions.length > 0 && this.answeredInteractiveMessageIds.has(message.id);
+      });
       if (alreadyAnswered) {
         logger.warn(
           {
@@ -152,7 +158,7 @@ export class EvolutionApiClient implements ConversationClient {
     }
 
     await delay(this.actionDelayMs);
-    this.lastOutboundAt = Date.now();
+    this.markOutboundCheckpoint();
     await this.request("POST", `/message/sendText/${encodeURIComponent(this.instance)}`, {
       number: this.contactNumber,
       text: option.text || option.id,
@@ -191,10 +197,16 @@ export class EvolutionApiClient implements ConversationClient {
 
     while (Date.now() - startedAt < timeoutMs) {
       const incoming = await this.fetchIncomingMessages();
-      const newMessages = incoming.filter((message) => !this.seenMessageIds.has(message.id));
+      const currentIncoming = this.messagesAfterLastOutbound(incoming);
+      const newMessages = currentIncoming.filter((message) => !this.seenMessageIds.has(message.id));
 
       for (const message of [...newMessages].reverse()) {
         this.seenMessageIds.add(message.id);
+        if (isPdfMessage(message) && patterns.some((pattern) => pattern.test("pdf"))) {
+          const settledText = await this.waitForSettledDecision(message.id, options);
+          return settledText.trim() ? `${settledText}\nPDF` : "PDF";
+        }
+
         if (message.text.trim() && patterns.some((pattern) => pattern.test(normalizeText(message.text)))) {
           return this.waitForSettledDecision(message.id, options);
         }
@@ -228,7 +240,8 @@ export class EvolutionApiClient implements ConversationClient {
 
     while (Date.now() - startedAt < timeoutMs) {
       const incoming = await this.fetchIncomingMessages();
-      const media = [...incoming].reverse().find((message) => isPdfMessage(message));
+      const currentIncoming = this.messagesAfterLastOutbound(incoming);
+      const media = [...currentIncoming].reverse().find((message) => isPdfMessage(message));
       if (media?.mediaMessageId) return this.downloadMediaMessage(media);
       await delay(this.pollIntervalMs);
     }
@@ -332,15 +345,28 @@ export class EvolutionApiClient implements ConversationClient {
     }
   ): string {
     const currentMessages = this.messagesAfterLastOutbound(messages);
-    const selectedMessages = currentMessages.length > 0 ? currentMessages : messages.slice(-3);
+    const selectedMessages = currentMessages;
     const latest = selectedMessages.at(-1);
     const text = latest ? this.textForDecision(selectedMessages, latest) : "";
     return options?.visibleTextSelector?.(text) ?? text;
   }
 
   private messagesAfterLastOutbound(messages: EvolutionMessage[]): EvolutionMessage[] {
-    if (!this.lastOutboundAt) return messages;
-    return messages.filter((message) => message.timestamp >= this.lastOutboundAt - 1000);
+    if (!this.lastOutboundAt) {
+      return messages.filter((message) => !this.initialIncomingMessageIds.has(message.id));
+    }
+
+    return messages.filter((message) => {
+      if (this.lastOutboundIncomingMessageIds.has(message.id)) return false;
+      return message.timestamp === 0 || message.timestamp >= this.lastOutboundAt - 1000;
+    });
+  }
+
+  private markOutboundCheckpoint(): void {
+    this.lastOutboundAt = Date.now();
+    this.lastOutboundIncomingMessageIds = new Set(
+      this.latestMessages.filter((message) => !message.fromMe).map((message) => message.id)
+    );
   }
 
   private async waitForSettledDecision(
@@ -487,10 +513,11 @@ function findInteractiveOption(
 
 function extractText(message: Record<string, unknown> | undefined): string | undefined {
   if (!message) return undefined;
+  const documentMessage = findNestedRecord(message, "documentMessage");
   const parts = [
     readString(message.conversation),
     readString(readRecord(message, "extendedTextMessage")?.text),
-    readString(readRecord(message, "documentMessage")?.caption),
+    readString(documentMessage?.caption),
     readString(readRecord(message, "imageMessage")?.caption),
     extractButtonsMessageText(readRecord(message, "buttonsMessage")),
     extractListMessageText(readRecord(message, "listMessage")),
@@ -545,13 +572,44 @@ function extractTemplateMessageText(message: Record<string, unknown> | undefined
 
 function extractMedia(message: Record<string, unknown> | undefined): { mimetype?: string; fileName?: string } | undefined {
   if (!message) return undefined;
-  const documentMessage = readRecord(message, "documentMessage");
+  const documentMessage = findNestedRecord(message, "documentMessage");
   if (documentMessage) {
     return {
       mimetype: readString(documentMessage.mimetype),
       fileName: readString(documentMessage.fileName)
     };
   }
+  return undefined;
+}
+
+function findNestedRecord(
+  value: Record<string, unknown> | undefined,
+  key: string,
+  depth = 0,
+  seen = new Set<unknown>()
+): Record<string, unknown> | undefined {
+  if (!value || depth > 8 || seen.has(value)) return undefined;
+  seen.add(value);
+
+  const direct = readRecord(value, key);
+  if (direct) return direct;
+
+  for (const nested of Object.values(value)) {
+    if (isRecord(nested)) {
+      const found = findNestedRecord(nested, key, depth + 1, seen);
+      if (found) return found;
+      continue;
+    }
+
+    if (Array.isArray(nested)) {
+      for (const item of nested) {
+        if (!isRecord(item)) continue;
+        const found = findNestedRecord(item, key, depth + 1, seen);
+        if (found) return found;
+      }
+    }
+  }
+
   return undefined;
 }
 
@@ -567,7 +625,7 @@ function readTimestamp(value: unknown): number {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) return parsed;
   }
-  return Date.now();
+  return 0;
 }
 
 function readRecord(value: unknown, key: string): Record<string, unknown> | undefined {

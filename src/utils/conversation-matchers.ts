@@ -18,6 +18,12 @@ export const identifierRequestPatterns = [
   /informe.*numero/
 ];
 
+export const identifierRejectedPatterns = [
+  /informacao nao esta correta/,
+  /parece que essa informacao nao esta correta/,
+  /vamos tentar novamente/
+];
+
 export const accountConfirmationPatterns = [
   /voce confirma/,
   /so pra confirmar/,
@@ -28,6 +34,7 @@ export const accountConfirmationPatterns = [
 ];
 
 export const invoiceServicePatterns = [
+  /sobre o que voce gostaria de falar hoje/,
   /segunda via/,
   /emitir.*fatura/,
   /fatura de energia/,
@@ -37,12 +44,41 @@ export const invoiceServicePatterns = [
   /consulta de debitos/
 ];
 
-export const documentDigitsRequestPatterns = [
+export const documentDigitsPrimeirosPatterns = [
+  /4 primeiros/,
+  /quatro primeiros/,
+  /primeiros digitos/,
+  /primeiros numeros/
+];
+
+export const documentDigitsUltimosPatterns = [
   /4 ultimos/,
   /quatro ultimos/,
-  /4 primeiros/,
-  /primeiros digitos/,
   /ultimos digitos/,
+  /ultimos numeros/
+];
+
+export const birthDateRequestPatterns = [
+  /data de nascimento/,
+  /data de nascimento de quem e titular/,
+  /digite.*data de nascimento/,
+  /informe.*data de nascimento/,
+  /formato dd\/mm\/aaaa/,
+  /dd\/mm\/aaaa/
+];
+
+export const rgDigitsRequestPatterns = [
+  /4 primeiros digitos do rg/,
+  /quatro primeiros digitos do rg/,
+  /digitos do rg/,
+  /validacao de seguranca/
+];
+
+export const documentDigitsRequestPatterns = [
+  ...documentDigitsPrimeirosPatterns,
+  ...documentDigitsUltimosPatterns,
+  ...birthDateRequestPatterns,
+  ...rgDigitsRequestPatterns,
   /cpf ou cnpj/,
   /validacao de seguranca/
 ];
@@ -64,6 +100,7 @@ export const invoiceListPatterns = [
 export const paymentMethodPatterns = [
   /como prefere pagar/,
   /pagar agora/,
+  /pagar boleto/,
   /pagar com boleto/,
   /codigo de barras/,
   /pagar com pix/,
@@ -87,15 +124,46 @@ export const invalidDataPatterns = [
   /pode ter sido um erro de digitacao/
 ];
 
+export const noOpenDebtsPatterns = [
+  /voce nao possui debitos faturados em aberto/,
+  /nao possui debitos faturados em aberto/
+];
+
+export const suspendedSupplyQuestionPatterns = [
+  /fornecimento de energia esta suspenso/,
+  /fornecimento.*suspenso/,
+  /falha de energia provocou/,
+  /esse e sobre esse assunto que voce deseja falar/
+];
+
+export const unsupportedSubjectPatterns = [
+  /poxa.*ainda nao consigo te ajudar.*assunto por aqui/,
+  /nao consigo te ajudar com esse assunto por aqui/,
+  /central de atendimento.*0800\s*721\s*2333/,
+  /conheca tambem o site da equatorial ceee/
+];
+
 export const pixQuestionPatterns = [/codigo do pix/, /copia e cola/];
 export const moreInvoiceQuestionPatterns = [/receber alguma outra conta/, /deseja mais alguma fatura/, /outra conta/];
 export const moreSubjectQuestionPatterns = [/quer falar sobre mais alguma coisa/, /mais alguma coisa/];
-export const ratingQuestionPatterns = [/muito bom/, /neutro/, /muito ruim/, /o que achou da nossa conversa/];
+export const ratingQuestionPatterns = [
+  /muito bom/,
+  /neutro/,
+  /muito ruim/,
+  /o que achou da nossa conversa/,
+  /antes de encerrar/,
+  /voce pode me contar/,
+  /contar.*atendimento/,
+  /pesquisa/
+];
 export const donePatterns = [/que bom.*feliz.*ajudar/, /fico muito feliz.*ajudar/];
 export const finalGoodbyePatterns = [/tchau/, /ate a proxima/, /agradecemos seu contato/, /obrigada por compartilhar/];
 
 export const conversationRecoveryPatterns = [
   ...invalidDataPatterns,
+  ...noOpenDebtsPatterns,
+  ...suspendedSupplyQuestionPatterns,
+  ...unsupportedSubjectPatterns,
   ...consentRequestPatterns,
   ...identifierRequestPatterns,
   ...accountConfirmationPatterns,
@@ -118,10 +186,29 @@ export function matchesAny(text: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(normalized));
 }
 
+export function isPedindoPrimeiros(text: string): boolean {
+  return matchesAny(text, documentDigitsPrimeirosPatterns);
+}
+
+export function isPedindoUltimos(text: string): boolean {
+  return matchesAny(text, documentDigitsUltimosPatterns);
+}
+
+export function isPedindoDataDeNascimento(text: string): boolean {
+  return matchesAny(text, birthDateRequestPatterns);
+}
+
+export function isPedindoRg(text: string): boolean {
+  return matchesAny(text, rgDigitsRequestPatterns);
+}
+
 export function describeConversationIntent(text: string): string {
   const normalized = normalizeText(text);
   const candidates: Array<{ intent: string; patterns: RegExp[]; priority: number }> = [
     { intent: "invalid_data", patterns: invalidDataPatterns, priority: 100 },
+    { intent: "no_open_debts", patterns: noOpenDebtsPatterns, priority: 99 },
+    { intent: "suspended_supply_question", patterns: suspendedSupplyQuestionPatterns, priority: 98 },
+    { intent: "unsupported_subject", patterns: unsupportedSubjectPatterns, priority: 98 },
     { intent: "done", patterns: [...donePatterns, ...finalGoodbyePatterns], priority: 95 },
     { intent: "rating_question", patterns: ratingQuestionPatterns, priority: 90 },
     { intent: "more_subject_question", patterns: moreSubjectQuestionPatterns, priority: 85 },
