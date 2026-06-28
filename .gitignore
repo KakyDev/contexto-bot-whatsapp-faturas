@@ -21,7 +21,9 @@ pnpm-debug.log*
 
 # WhatsApp/browser session data
 .browser-profile/
+.browser-profile-*/
 .whatsapp-terminal-auth/
+.whatsapp-terminal-auth-*/
 .baileys-auth/
 .wwebjs_cache/
 .wwebjs_auth/

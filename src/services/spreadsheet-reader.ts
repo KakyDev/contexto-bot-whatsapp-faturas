@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import * as XLSX from "xlsx";
 import { rawInvoiceJobSchema, toInvoiceJob, type InvoiceJob } from "../domain/invoice-job.js";
+import type { BotId } from "../domain/bot.js";
 
 function parseDelimitedLine(line: string, delimiter: string): string[] {
   const cells: string[] = [];
@@ -44,7 +45,11 @@ function readCsvRows(filePath: string): Record<string, unknown>[] {
   });
 }
 
-export function readSpreadsheet(filePath: string): InvoiceJob[] {
+export interface ReadSpreadsheetOptions {
+  bot?: BotId;
+}
+
+export function readSpreadsheet(filePath: string, options: ReadSpreadsheetOptions = {}): InvoiceJob[] {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Arquivo de entrada nao encontrado: ${filePath}`);
   }
@@ -70,7 +75,11 @@ export function readSpreadsheet(filePath: string): InvoiceJob[] {
       throw new Error(`Linha ${index + 2}: ${issue?.path.join(".") || "dados"} invalido`);
     }
     try {
-      return toInvoiceJob(parsed.data, index);
+      const dynamicReference = options.bot === "maranhao";
+      return toInvoiceJob(parsed.data, index, {
+        dynamicReference,
+        requireDocument: !dynamicReference
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Linha ${index + 2}: ${message}`);

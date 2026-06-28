@@ -53,10 +53,16 @@ Validar a planilha sem abrir WhatsApp:
 npm run dry-run -- --input ./data/entrada.xlsx
 ```
 
-Executar o bot:
+Executar o bot CEEE:
 
 ```bash
-npm run dev -- --input ./data/entrada.xlsx
+npm run dev -- --bot ceee --input ./data/entrada.xlsx
+```
+
+Executar o bot Maranhao:
+
+```bash
+npm run dev -- --bot maranhao
 ```
 
 Por padrao, o bot usa o modo terminal com `whatsapp-web.js`, sem automacao visual por clique. Na primeira execucao, escaneie o QR Code exibido no terminal.
@@ -72,7 +78,7 @@ EVOLUTION_INSTANCE="sua-instancia"
 Depois execute:
 
 ```bash
-npm run dev -- --transport evolution --input ./data/entrada.xlsx
+npm run dev -- --bot ceee --transport evolution --input ./data/entrada.xlsx
 ```
 
 Esse modo usa a API para enviar mensagens, consultar as respostas e baixar o PDF recebido, sem depender do DOM do WhatsApp Web.
@@ -80,6 +86,14 @@ Esse modo usa a API para enviar mensagens, consultar as respostas e baixar o PDF
 ```bash
 npm run dev:terminal -- --input ./data/entrada.xlsx
 ```
+
+Para testar somente o envio pelo modo terminal antes de processar a planilha:
+
+```bash
+npm run dev:terminal -- --bot ceee --send-test "Ola"
+```
+
+No modo terminal, o envio espera a confirmacao de entrega do WhatsApp. Se ficar preso em 1 tique, o bot para com `delivery_not_confirmed`; nesse caso, remova o aparelho vinculado antigo no celular, recrie a sessao `./.whatsapp-terminal-auth` e escaneie o QR novamente.
 
 Para usar o modo antigo com navegador/Playwright:
 
@@ -92,6 +106,35 @@ Reprocessar somente linhas que já saíram com erro em `output/resultados.csv`:
 ```bash
 npm run dev -- --input ./data/entrada.xlsx --retry-errors
 ```
+
+## Bots
+
+O bot ativo pode ser escolhido por argumento:
+
+```bash
+npm run dev -- --bot ceee
+npm run dev -- --bot maranhao
+```
+
+Tambem pode ser definido no `.env`:
+
+```env
+BOT=ceee
+```
+
+O CEEE continua usando as variaveis antigas como padrao (`INPUT_FILE`, `OUTPUT_RESULTS_FILE`, `OUTPUT_ATTEMPTS_FILE`, `OUTPUT_INVOICES_DIR`, `OUTPUT_ERROR_SCREENSHOTS_DIR`, `WHATSAPP_CONTACT_PHONE`).
+
+O Maranhao usa caminhos proprios por padrao:
+
+```txt
+data/maranhao/entrada.xlsx
+output/maranhao/resultados.csv
+output/maranhao/attempts.csv
+output/maranhao/invoices
+output/maranhao/errors/screenshots
+```
+
+Se precisar, configure overrides especificos no `.env`, por exemplo `MARANHAO_INPUT_FILE`, `MARANHAO_OUTPUT_RESULTS_FILE`, `MARANHAO_OUTPUT_ATTEMPTS_FILE`, `MARANHAO_OUTPUT_INVOICES_DIR` e `MARANHAO_WHATSAPP_CONTACT_PHONE`.
 
 ## Login no WhatsApp Web
 

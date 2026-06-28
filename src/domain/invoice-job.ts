@@ -53,6 +53,11 @@ export interface InvoiceJobGroup {
   mesesPendentes: string[];
 }
 
+export interface InvoiceJobOptions {
+  dynamicReference?: boolean;
+  requireDocument?: boolean;
+}
+
 function requiredCell(value: unknown, field: string): string {
   const text = value === undefined || value === null ? "" : String(value).trim();
   if (!text) throw new Error(`${field} obrigatorio`);
@@ -76,12 +81,23 @@ function buildJobId(rawId: unknown, codigoVenda: string, refOriginal: string, in
   return String(index + 1);
 }
 
-export function toInvoiceJob(raw: RawInvoiceJob, index: number): InvoiceJob {
+export function toInvoiceJob(raw: RawInvoiceJob, index: number, options: InvoiceJobOptions = {}): InvoiceJob {
+  const requireDocument = options.requireDocument ?? true;
   const codigoVenda = raw.codigo_venda === undefined ? "" : String(raw.codigo_venda).trim();
   const identificador = normalizeDigits(requiredCell(raw.identificador ?? raw.uc, "identificador/uc"));
-  const cpfCnpj = normalizeDigits(requiredCell(raw.cpf_cnpj ?? raw.cpf, "cpf_cnpj/cpf"));
-  const refOriginal = requiredCell(raw.mes_referencia ?? raw.ref, "mes_referencia/ref");
-  const mesReferencia = normalizeReference(refOriginal);
+  const cpfCnpj = normalizeDigits(
+    requireDocument
+      ? requiredCell(raw.cpf_cnpj ?? raw.cpf, "cpf_cnpj/cpf")
+      : String(raw.cpf_cnpj ?? raw.cpf ?? "")
+  );
+  const rawReference = raw.mes_referencia ?? raw.ref;
+  const refOriginal =
+    rawReference === undefined || rawReference === null || String(rawReference).trim() === ""
+      ? options.dynamicReference
+        ? "DINAMICO"
+        : requiredCell(rawReference, "mes_referencia/ref")
+      : String(rawReference).trim();
+  const mesReferencia = options.dynamicReference && refOriginal === "DINAMICO" ? "DINAMICO" : normalizeReference(refOriginal);
   const rawDataDeNascimento = raw.data_de_nascimento === undefined ? "" : String(raw.data_de_nascimento).trim();
   const normalizedBirthDate = rawDataDeNascimento.toLowerCase() === "undefined" ? "" : rawDataDeNascimento;
   const validBirthDate = /^\d{2}\/\d{2}\/\d{4}$/.test(normalizedBirthDate) ? normalizedBirthDate : "";
@@ -96,10 +112,10 @@ export function toInvoiceJob(raw: RawInvoiceJob, index: number): InvoiceJob {
   const documentLastDigits = /^\d{4}$/.test(firstDigitsFromColumn) ? firstDigitsFromColumn : cpfPrimeiros4;
 
   if (!/^\d+$/.test(identificador)) throw new Error("identificador deve conter somente numeros");
-  if (!/^\d+$/.test(cpfCnpj)) throw new Error("cpf_cnpj deve conter somente numeros");
-  if (!/^\d{4}$/.test(documentLastDigits)) throw new Error("4 primeiros do cpf_cnpj/cpf deve conter 4 digitos");
-  if (!/^\d{4}$/.test(cpfPrimeiros4)) throw new Error("CPF deve ter pelo menos 4 dígitos");
-  if (!/^\d{4}$/.test(cpfUltimos4)) throw new Error("CPF deve ter pelo menos 4 dígitos");
+  if (requireDocument && !/^\d+$/.test(cpfCnpj)) throw new Error("cpf_cnpj deve conter somente numeros");
+  if (requireDocument && !/^\d{4}$/.test(documentLastDigits)) throw new Error("4 primeiros do cpf_cnpj/cpf deve conter 4 digitos");
+  if (requireDocument && !/^\d{4}$/.test(cpfPrimeiros4)) throw new Error("CPF deve ter pelo menos 4 dígitos");
+  if (requireDocument && !/^\d{4}$/.test(cpfUltimos4)) throw new Error("CPF deve ter pelo menos 4 dígitos");
 
   return {
     id: buildJobId(raw.id, codigoVenda, refOriginal, index),

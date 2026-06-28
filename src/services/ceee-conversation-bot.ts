@@ -43,8 +43,9 @@ import {
 } from "../utils/conversation-matchers.js";
 
 const QUICK_STATE_TIMEOUT_MS = env.BOT_STEP_TIMEOUT_MS;
-const RECOVERY_PROBE_ATTEMPTS = 3;
 const UNSUPPORTED_SUBJECT_PROBE_TIMEOUT_MS = Math.max(env.BOT_STEP_TIMEOUT_MS, 90_000);
+const MAX_PDF_NAVIGATION_STEPS = 12;
+const INITIAL_CONSENT_PROBE_MS = 5_000;
 
 type ConversationIntent =
   | "consent_request"
@@ -81,7 +82,16 @@ export interface ConversationGroupResult {
   results: ConversationJobResult[];
 }
 
-class ConversationFailure extends Error {
+export interface CeeeConversationBotConfig {
+  whatsappContactPhone: string;
+  expectedChatName: string;
+  outputInvoicesDir: string;
+  outputErrorScreenshotsDir: string;
+  defaultInitialMessage: string;
+  defaultRating: string;
+}
+
+export class ConversationFailure extends Error {
   constructor(
     public readonly status: InvoiceStatus,
     message: string,
@@ -92,7 +102,22 @@ class ConversationFailure extends Error {
 }
 
 export class CeeeConversationBot {
-  constructor(private readonly client: ConversationClient) {}
+  protected readonly config: CeeeConversationBotConfig;
+
+  constructor(
+    protected readonly client: ConversationClient,
+    config: Partial<CeeeConversationBotConfig> = {}
+  ) {
+    this.config = {
+      whatsappContactPhone: env.WHATSAPP_CONTACT_PHONE,
+      expectedChatName: "CEEE Grupo Equatorial",
+      outputInvoicesDir: env.OUTPUT_INVOICES_DIR,
+      outputErrorScreenshotsDir: env.OUTPUT_ERROR_SCREENSHOTS_DIR,
+      defaultInitialMessage: env.DEFAULT_INITIAL_MESSAGE,
+      defaultRating: env.DEFAULT_RATING,
+      ...config
+    };
+  }
 
   async process(job: InvoiceJob): Promise<ConversationResult> {
     const group = this.groupFromSingleJob(job);
@@ -121,10 +146,13 @@ export class CeeeConversationBot {
         },
         "iniciando conversa agrupada"
       );
-      await this.client.openConversationByPhone(env.WHATSAPP_CONTACT_PHONE);
-      await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
+      await this.client.openConversationByPhone(this.config.whatsappContactPhone, this.config.expectedChatName);
+      await this.client.sendMessage(this.config.defaultInitialMessage);
 
-      const currentText = await this.waitInitialResponseAfterHello();
+      let currentText = await this.waitInitialResponseAfterHello();
+      if (this.intentFromText(currentText) !== "consent_request") {
+        currentText = (await this.clickConsentIfVisibleAndWaitNext(INITIAL_CONSENT_PROBE_MS)) ?? currentText;
+      }
       let invoiceText = await this.navigateUntilInvoiceList(representativeJob, currentText, [...pendingReferences]);
 
       while (pendingReferences.size > 0) {
@@ -154,7 +182,7 @@ export class CeeeConversationBot {
         await this.client.sendMessage(invoice.option);
 
         await this.navigateUntilPdfReady(job);
-        const targetPath = invoicePdfPathForJob(resolveProjectPath(env.OUTPUT_INVOICES_DIR), job);
+        const targetPath = invoicePdfPathForJob(resolveProjectPath(this.config.outputInvoicesDir), job);
         logger.info({ identificador: job.identificador, mesReferencia: job.mesReferencia, arquivoPdf: targetPath }, "baixando pdf");
         const download = await this.client.downloadLatestPdf(env.PDF_DOWNLOAD_TIMEOUT_MS).catch((error) => {
           throw new ConversationFailure("download_error", error instanceof Error ? error.message : String(error));
@@ -309,14 +337,14 @@ export class CeeeConversationBot {
     }));
   }
 
-  private async wait(
+  protected async wait(
     state: string,
     patterns: RegExp[],
     options: {
       includeVisibleTextFallback?: boolean;
       visibleTextSelector?: (text: string) => string;
       requireVisibleTextChange?: boolean;
-      recoverWithProbe?: boolean;
+      recoverOnTimeout?: boolean;
       timeoutMs?: number;
     } = {}
   ): Promise<string> {
@@ -354,10 +382,7 @@ export class CeeeConversationBot {
           return selectedVisibleText;
         }
 
-        if (options.recoverWithProbe === false) {
-          throw new ConversationFailure("timeout", `Timeout no estado ${state}`);
-        }
-        return this.recoverStateWithProbe(state, patterns, options);
+        throw new ConversationFailure("timeout", `Timeout no estado ${state}`);
       }
       throw error;
     }
@@ -382,20 +407,49 @@ export class CeeeConversationBot {
     ];
   }
 
-  private intentFromText(text: string): ConversationIntent {
+  protected intentFromText(text: string): ConversationIntent {
     return describeConversationIntent(text) as ConversationIntent;
+  }
+
+  private async sendMessageWithRetry(text: string, context: string): Promise<void> {
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.client.sendMessage(text);
+        return;
+      } catch (error) {
+        if (!this.isTransientSendError(error) || attempt === maxAttempts) throw error;
+        logger.warn(
+          {
+            context,
+            attempt,
+            maxAttempts,
+            erro: error instanceof Error ? error.message : String(error)
+          },
+          "falha transitoria ao enviar mensagem; tentando reenviar"
+        );
+        await delay(attempt * 10_000);
+      }
+    }
+  }
+
+  private isTransientSendError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /connection closed|timeout|socket|econnreset/i.test(message);
   }
 
   private allConversationStatePatterns(): RegExp[] {
     return conversationRecoveryPatterns;
   }
 
-  private async waitForAnyKnownState(
+  protected async waitForAnyKnownState(
     state: string,
     options: {
       includeVisibleTextFallback?: boolean;
       visibleTextSelector?: (text: string) => string;
       requireVisibleTextChange?: boolean;
+      recoverOnTimeout?: boolean;
       timeoutMs?: number;
     } = {}
   ): Promise<string> {
@@ -406,45 +460,10 @@ export class CeeeConversationBot {
     });
   }
 
-  private async probeAndWaitKnownState(state: string): Promise<string> {
-    return this.probeUntilKnownState(state, this.allConversationStatePatterns());
-  }
-
-  private async probeUntilKnownState(state: string, patterns: RegExp[]): Promise<string> {
-    let lastText = "";
-
-    for (let attempt = 1; attempt <= RECOVERY_PROBE_ATTEMPTS; attempt += 1) {
-      logger.warn({ state, attempt }, "mensagem fora do fluxo conhecido; enviando ponto para localizar etapa");
-      await this.client.sendMessage(".");
-
-      const text = await this.client
-        .waitForMessageMatching(patterns, env.BOT_STEP_TIMEOUT_MS, {
-          includeVisibleTextFallback: true,
-          requireVisibleTextChange: true
-        })
-        .catch(async (error) => {
-          if (!(error instanceof Error) || error.message !== "timeout") throw error;
-          return this.client.getRecentIncomingText().catch(() => "");
-        });
-
-      lastText = text;
-      const intent = this.intentFromText(text);
-      if (intent === "unsupported_subject") {
-        return this.recoverFromUnsupportedSubject(state, text, true);
-      }
-
-      if (intent !== "unknown") {
-        logger.info({ state, attempt, intent, text: text.slice(-1200) }, "estado reconhecido apos recuperacao");
-        return text;
-      }
-
-      logger.warn({ state, attempt, text: text.slice(-500) }, "resposta de recuperacao ainda fora do fluxo conhecido");
-    }
-
-    throw new ConversationFailure(
-      "timeout",
-      `Nao foi possivel localizar etapa reconhecida em ${state}. Ultima mensagem: ${lastText.slice(-500)}`
-    );
+  protected async probeAndWaitKnownState(state: string): Promise<string> {
+    return this.waitForAnyKnownState(state, {
+      requireVisibleTextChange: true
+    });
   }
 
   private async navigateUntilInvoiceList(job: InvoiceJob, initialText: string, targetReferences = [job.mesReferencia]): Promise<string> {
@@ -499,6 +518,8 @@ export class CeeeConversationBot {
         }
         await this.client.sendOption(["Sim, Clara!", "Sim"], "Sim, Clara!");
         consentAnswered = true;
+        identifierSent = false;
+        cpfIdentifierSent = false;
         currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_CONSENT", [
           ...identifierRequestPatterns,
           ...accountConfirmationPatterns,
@@ -551,6 +572,27 @@ export class CeeeConversationBot {
           );
         }
 
+        if (identifierSent && accountConfirmed && !matchesAny(currentText, identifierRejectedPatterns)) {
+          logger.info(
+            { identificador: job.identificador },
+            "CEEE solicitou identificador novamente apos confirmacao; reenviando UC"
+          );
+          await this.client.sendMessage(job.identificador);
+          currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_RESENT_IDENTIFIER", [
+            ...accountConfirmationPatterns,
+            ...invoiceServicePatterns,
+            ...invoiceListPatterns,
+            ...identifierRequestPatterns,
+            ...identifierRejectedPatterns,
+            ...noOpenDebtsPatterns,
+            ...suspendedSupplyQuestionPatterns,
+            ...invalidDataPatterns
+          ], {
+            requireVisibleTextChange: true
+          });
+          continue;
+        }
+
         if (identifierSent) {
           currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_REPEATED_IDENTIFIER_REQUEST", [
             ...accountConfirmationPatterns,
@@ -585,6 +627,8 @@ export class CeeeConversationBot {
       if (intent === "account_confirmation") {
         if (accountConfirmed) {
           currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_REPEATED_ACCOUNT_CONFIRMATION", [
+            ...identifierRequestPatterns,
+            ...identifierRejectedPatterns,
             ...invoiceServicePatterns,
             ...invoiceListPatterns,
             ...noOpenDebtsPatterns,
@@ -596,9 +640,11 @@ export class CeeeConversationBot {
           continue;
         }
         this.logHolderDivergence(job, currentText);
-        await this.client.sendOption(["Confirmo"], "Confirmo");
+        await this.client.sendOption(["Confirmo", "Sim"], "Confirmo");
         accountConfirmed = true;
         currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_ACCOUNT_CONFIRMATION", [
+            ...identifierRequestPatterns,
+            ...identifierRejectedPatterns,
             ...invoiceServicePatterns,
             ...invoiceListPatterns,
             ...noOpenDebtsPatterns,
@@ -612,20 +658,7 @@ export class CeeeConversationBot {
 
       if (intent === "invoice_service_options") {
         if (invoiceServiceSelected) {
-          currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_REPEATED_INVOICE_SERVICE", [
-            ...invoiceListPatterns,
-            ...documentDigitsRequestPatterns,
-            ...documentDigitsInvalidPatterns,
-            ...noOpenDebtsPatterns,
-            ...moreSubjectQuestionPatterns,
-            ...ratingQuestionPatterns,
-            ...donePatterns,
-            ...finalGoodbyePatterns,
-            ...invalidDataPatterns
-          ], {
-            visibleTextSelector: latestInvoiceSelectionBlock,
-            requireVisibleTextChange: true
-          });
+          currentText = await this.waitAfterInvoiceServiceSelection(job, "WAITING_STATE_AFTER_REPEATED_INVOICE_SERVICE");
           continue;
         }
         if (isGeneralServicesMenu(currentText)) {
@@ -637,25 +670,12 @@ export class CeeeConversationBot {
           );
         }
         invoiceServiceSelected = true;
-        currentText = await this.waitForNextActionableState("WAITING_STATE_AFTER_INVOICE_SERVICE", [
-          ...invoiceListPatterns,
-          ...documentDigitsRequestPatterns,
-          ...documentDigitsInvalidPatterns,
-          ...noOpenDebtsPatterns,
-          ...moreSubjectQuestionPatterns,
-          ...ratingQuestionPatterns,
-          ...donePatterns,
-          ...finalGoodbyePatterns,
-          ...invalidDataPatterns
-        ], {
-          visibleTextSelector: latestInvoiceSelectionBlock,
-          requireVisibleTextChange: true
-        });
+        currentText = await this.waitAfterInvoiceServiceSelection(job, "WAITING_STATE_AFTER_INVOICE_SERVICE");
         continue;
       }
 
       if (intent === "document_digits_request" || intent === "document_digits_invalid") {
-        return this.sendLastDigitsAndWaitForInvoices(job, targetReferences);
+        return this.sendValidationDataUntilInvoiceList(job, targetReferences, currentText);
       }
 
       if (intent === "invoice_list") {
@@ -676,7 +696,7 @@ export class CeeeConversationBot {
         );
         await this.answerNoAtConversationEnd("pergunta sobre outro assunto antes de reiniciar atendimento");
         await this.finishConversationWithFollowUp({ answeredMoreSubject: true });
-        await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
+        await this.client.sendMessage(this.config.defaultInitialMessage);
         currentText = await this.waitForAnyKnownState("WAITING_STATE_AFTER_RESTART_FROM_MORE_SUBJECT_ANSWERED_NO", {
           requireVisibleTextChange: true
         });
@@ -684,7 +704,7 @@ export class CeeeConversationBot {
       }
 
       if (intent === "more_invoice_question" || intent === "rating_question" || intent === "done") {
-        await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
+        await this.client.sendMessage(this.config.defaultInitialMessage);
         currentText = await this.waitForAnyKnownState("WAITING_STATE_AFTER_RESTART_FROM_FINISHED_CONVERSATION", {
           requireVisibleTextChange: true
         });
@@ -697,14 +717,50 @@ export class CeeeConversationBot {
     throw new ConversationFailure("timeout", "Timeout ao navegar ate a lista de faturas");
   }
 
-  private async waitInitialResponseAfterHello(): Promise<string> {
+  private async waitAfterInvoiceServiceSelection(job: InvoiceJob, state: string): Promise<string> {
+    const patterns = [
+      ...invoiceListPatterns,
+      ...documentDigitsRequestPatterns,
+      ...documentDigitsInvalidPatterns,
+      ...noOpenDebtsPatterns,
+      ...moreSubjectQuestionPatterns,
+      ...ratingQuestionPatterns,
+      ...donePatterns,
+      ...finalGoodbyePatterns,
+      ...invalidDataPatterns
+    ];
+    const options = {
+      visibleTextSelector: latestInvoiceSelectionBlock,
+      requireVisibleTextChange: true
+    };
+
+    try {
+      return await this.waitForNextActionableState(state, patterns, {
+        ...options
+      });
+    } catch (error) {
+      if (!(error instanceof ConversationFailure) || error.status !== "timeout") throw error;
+      logger.warn(
+        {
+          identificador: job.identificador,
+          state,
+          fallback: "Segunda via de Fatura",
+          erro: error.message
+        },
+        "CEEE nao avancou apos botao de segunda via; tentando fallback textual"
+      );
+      await this.client.sendMessage("Segunda via de Fatura");
+      return this.waitForNextActionableState(`${state}_TEXT_FALLBACK`, patterns, options);
+    }
+  }
+
+  protected async waitInitialResponseAfterHello(): Promise<string> {
     const patterns = this.initialResponsePatterns();
 
     try {
       return await this.wait("WAITING_CONSENT", patterns, {
         includeVisibleTextFallback: true,
-        requireVisibleTextChange: true,
-        recoverWithProbe: false
+        requireVisibleTextChange: true
       });
     } catch (error) {
       if (!(error instanceof ConversationFailure) || error.status !== "timeout") throw error;
@@ -712,22 +768,24 @@ export class CeeeConversationBot {
       logger.warn({ state: "WAITING_CONSENT" }, "sem resposta inicial; encerrando conversa suja e reiniciando");
       await this.client.sendMessage("Sair");
       await delay(8000);
-      await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE);
+      await this.client.sendMessage(this.config.defaultInitialMessage);
 
       return this.wait("WAITING_CONSENT_AFTER_RESET", patterns, {
         includeVisibleTextFallback: true,
-        requireVisibleTextChange: true,
-        recoverWithProbe: false
+        requireVisibleTextChange: true
       });
     }
   }
 
-  private async clickConsentIfVisibleAndWaitNext(timeoutMs: number): Promise<string | undefined> {
+  protected async clickConsentIfVisibleAndWaitNext(timeoutMs: number): Promise<string | undefined> {
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < timeoutMs) {
-      const visibleText = await this.client.getVisibleText().catch(() => "");
-      if (!matchesAny(visibleText, consentRequestPatterns)) {
+      const [recentIncomingText, visibleText] = await Promise.all([
+        this.client.getRecentIncomingText().catch(() => ""),
+        this.client.getVisibleText().catch(() => "")
+      ]);
+      if (!matchesAny(`${recentIncomingText}\n${visibleText}`, consentRequestPatterns)) {
         await delay(1000);
         continue;
       }
@@ -750,7 +808,6 @@ export class CeeeConversationBot {
           ], {
             includeVisibleTextFallback: true,
             requireVisibleTextChange: true,
-            recoverWithProbe: false,
             timeoutMs: QUICK_STATE_TIMEOUT_MS
           });
         } catch (error) {
@@ -773,13 +830,14 @@ export class CeeeConversationBot {
     return undefined;
   }
 
-  private async waitForNextActionableState(
+  protected async waitForNextActionableState(
     state: string,
     patterns: RegExp[],
     options: {
       includeVisibleTextFallback?: boolean;
       visibleTextSelector?: (text: string) => string;
       requireVisibleTextChange?: boolean;
+      recoverOnTimeout?: boolean;
       timeoutMs?: number;
     } = {}
   ): Promise<string> {
@@ -789,7 +847,6 @@ export class CeeeConversationBot {
     while (Date.now() - startedAt < (options.timeoutMs ?? env.BOT_STEP_TIMEOUT_MS)) {
       const text = await this.wait(state, patterns, {
         includeVisibleTextFallback: true,
-        recoverWithProbe: false,
         timeoutMs: Math.min(15000, options.timeoutMs ?? env.BOT_STEP_TIMEOUT_MS),
         ...options
       }).catch(async (error) => {
@@ -798,12 +855,11 @@ export class CeeeConversationBot {
       });
 
       lastText = options.visibleTextSelector?.(text) ?? text;
-      if (lastText.trim() && matchesAny(lastText, moreSubjectQuestionPatterns)) return lastText;
+      if (lastText.trim() && matchesAny(lastText, patterns)) return lastText;
       if (matchesAny(lastText, unsupportedSubjectPatterns)) {
         return this.recoverFromUnsupportedSubject(state, lastText);
       }
 
-      if (lastText.trim() && matchesAny(lastText, patterns)) return lastText;
       if (isTransitionOnlyText(lastText)) {
         logger.info({ state, text: lastText.slice(-500) }, "mensagem intermediaria da CEEE; aguardando proxima etapa");
         await delay(2000);
@@ -814,34 +870,7 @@ export class CeeeConversationBot {
     throw new ConversationFailure("timeout", `Timeout no estado ${state}. Ultima mensagem: ${lastText.slice(-500)}`);
   }
 
-  private async recoverStateWithProbe(
-    state: string,
-    patterns: RegExp[],
-    options: {
-      includeVisibleTextFallback?: boolean;
-      visibleTextSelector?: (text: string) => string;
-      requireVisibleTextChange?: boolean;
-    }
-  ): Promise<string> {
-    const visibleText = await this.client.getVisibleText().catch(() => "");
-    const selectedVisibleText = options.visibleTextSelector?.(visibleText) ?? visibleText;
-    if (selectedVisibleText.trim() && patterns.some((pattern) => pattern.test(normalizeText(selectedVisibleText)))) {
-      logger.info(
-        {
-          state,
-          intent: describeConversationIntent(selectedVisibleText),
-          text: selectedVisibleText.slice(-1200)
-        },
-        "estado localizado na tela atual; recuperacao por ponto ignorada"
-      );
-      return selectedVisibleText;
-    }
-
-    const recoveryPatterns = [...patterns, ...conversationRecoveryPatterns];
-    return this.probeUntilKnownState(state, recoveryPatterns);
-  }
-
-  private moveDownloadedFile(sourcePath: string, targetPath: string): string {
+  protected moveDownloadedFile(sourcePath: string, targetPath: string): string {
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     if (sourcePath !== targetPath) {
       fs.copyFileSync(sourcePath, targetPath);
@@ -851,7 +880,7 @@ export class CeeeConversationBot {
     return targetPath;
   }
 
-  private throwIfInvalidData(text: string): void {
+  protected throwIfInvalidData(text: string): void {
     if (matchesAny(text, invalidDataPatterns)) {
       throw new ConversationFailure("invalid_data", "Identificador nao localizado pelo bot da CEEE");
     }
@@ -878,7 +907,7 @@ export class CeeeConversationBot {
     await this.finishConversationWithFollowUp();
 
     if (askedMoreSubject) {
-      await this.client.sendMessage(env.DEFAULT_INITIAL_MESSAGE).catch(() => {});
+      await this.client.sendMessage(this.config.defaultInitialMessage).catch(() => {});
     }
     // If we started a new conversation above, try to confirm consent so the next job won't time out
     if (askedMoreSubject) {
@@ -905,40 +934,103 @@ export class CeeeConversationBot {
     }
   }
 
-  private async sendLastDigitsAndWaitForInvoices(job: InvoiceJob, targetReferences = [job.mesReferencia]): Promise<string> {
-    // Analisa a mensagem do CEEE para determinar se está pedindo 4 primeiros ou 4 últimos
-    const recentText = await this.client.getRecentIncomingText().catch(() => "");
-    const digitsToSend = isPedindoUltimos(recentText) ? job.cpfUltimos4 : job.cpfPrimeiros4;
-    
-    logger.info(
-      {
-        identificador: job.identificador,
-        pedindoUltimos: isPedindoUltimos(recentText),
-        digitsToSend
-      },
-      "enviando dígitos do CPF"
-    );
-    
-    await this.client.sendMessage(digitsToSend);
-    const invoiceText = await this.wait("WAITING_OPEN_INVOICES_LIST", [
-      ...invoiceListPatterns,
-      ...invalidDataPatterns
-    ], {
-      includeVisibleTextFallback: true,
-      visibleTextSelector: latestInvoiceSelectionBlock,
-      requireVisibleTextChange: true
-    });
-    return this.waitForInvoiceListMatchingReferences(job, invoiceText, targetReferences);
+  private async sendValidationDataUntilInvoiceList(
+    job: InvoiceJob,
+    targetReferences = [job.mesReferencia],
+    initialPrompt = ""
+  ): Promise<string> {
+    let currentText = initialPrompt;
+    const maxAttempts = 5;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const recentText = await this.client.getRecentIncomingText().catch(() => "");
+      const promptText = currentText.trim() ? currentText : recentText;
+
+      if (matchesAny(promptText, invoiceListPatterns)) {
+        return this.waitForInvoiceListMatchingReferences(job, promptText, targetReferences);
+      }
+
+      if (isPedindoRg(promptText)) {
+        await this.finishRgRequiredConversation(job, attempt);
+      }
+
+      if (isPedindoDataDeNascimento(promptText)) {
+        if (!job.dataDeNascimento || job.dataDeNascimento === "0") {
+          logger.warn(
+            {
+              identificador: job.identificador,
+              attempt,
+              dataDeNascimento: job.dataDeNascimento
+            },
+            "data de nascimento indisponivel antes da lista; encerrando tentativa"
+          );
+          await this.client.sendMessage("Sair");
+          throw new ConversationFailure("invalid_data", "data_de_nascimento indisponivel");
+        }
+
+        logger.info(
+          {
+            identificador: job.identificador,
+            attempt,
+            dataDeNascimento: job.dataDeNascimento
+          },
+          "enviando data de nascimento antes da lista"
+        );
+        await this.sendMessageWithRetry(job.dataDeNascimento, "data de nascimento antes da lista");
+      } else {
+        const digitsToSend = isPedindoUltimos(promptText) ? job.cpfUltimos4 : job.cpfPrimeiros4;
+
+        logger.info(
+          {
+            identificador: job.identificador,
+            attempt,
+            pedindoUltimos: isPedindoUltimos(promptText),
+            digitsToSend
+          },
+          "enviando digitos do CPF antes da lista"
+        );
+        await this.sendMessageWithRetry(digitsToSend, "digitos do CPF antes da lista");
+      }
+
+      currentText = await this.wait("WAITING_OPEN_INVOICES_LIST", [
+        ...invoiceListPatterns,
+        ...documentDigitsInvalidPatterns,
+        ...documentDigitsRequestPatterns,
+        ...birthDateRequestPatterns,
+        ...rgDigitsRequestPatterns,
+        ...noOpenDebtsPatterns,
+        ...moreSubjectQuestionPatterns,
+        ...invalidDataPatterns,
+        ...unsupportedSubjectPatterns
+      ], {
+        includeVisibleTextFallback: true,
+        requireVisibleTextChange: true,
+        timeoutMs: Math.max(env.BOT_STEP_TIMEOUT_MS, 90_000)
+      });
+
+      if (matchesAny(currentText, unsupportedSubjectPatterns)) {
+        currentText = await this.recoverFromUnsupportedSubject("UNSUPPORTED_SUBJECT_DURING_PRE_LIST_VALIDATION", currentText);
+      }
+
+      if (matchesAny(currentText, noOpenDebtsPatterns) || matchesAny(currentText, moreSubjectQuestionPatterns)) {
+        await this.finishUnavailableInvoiceConversation(job, currentText);
+      }
+
+      if (matchesAny(currentText, invoiceListPatterns)) {
+        return this.waitForInvoiceListMatchingReferences(job, currentText, targetReferences);
+      }
+    }
+
+    throw new ConversationFailure("invalid_data", "Validacao da CEEE nao concluida antes da lista de faturas");
   }
 
   private async navigateUntilPdfReady(job: InvoiceJob): Promise<void> {
     let currentText = await this.waitForPostInvoiceSelectionState("WAITING_STATE_AFTER_INVOICE_SELECTION");
-    const startedAt = Date.now();
 
-    while (Date.now() - startedAt < env.BOT_STEP_TIMEOUT_MS * 3) {
+    for (let step = 1; step <= MAX_PDF_NAVIGATION_STEPS; step += 1) {
       this.throwIfInvalidData(currentText);
       const intent = this.intentFromText(currentText);
-      logger.info({ identificador: job.identificador, intent }, "estado pos-selecao identificado");
+      logger.info({ identificador: job.identificador, intent, step }, "estado pos-selecao identificado");
 
       if (intent === "unsupported_subject") {
         currentText = await this.recoverFromUnsupportedSubject("UNSUPPORTED_SUBJECT_BEFORE_PDF", currentText);
@@ -975,7 +1067,7 @@ export class CeeeConversationBot {
       currentText = await this.waitForPostInvoiceSelectionState("WAITING_RECOGNIZABLE_STATE_BEFORE_PDF");
     }
 
-    throw new ConversationFailure("timeout", "Timeout ao navegar ate o PDF");
+    throw new ConversationFailure("timeout", "Limite de etapas atingido ao navegar ate o PDF");
   }
 
   private async waitForPostInvoiceSelectionState(state: string): Promise<string> {
@@ -1024,7 +1116,7 @@ export class CeeeConversationBot {
           "enviando data de nascimento"
         );
         
-        await this.client.sendMessage(job.dataDeNascimento);
+        await this.sendMessageWithRetry(job.dataDeNascimento, "data de nascimento");
         const response = await this.wait("WAITING_PDF_OR_DATE_RETRY", [
           ...documentDigitsInvalidPatterns,
           ...birthDateRequestPatterns,
@@ -1082,10 +1174,12 @@ export class CeeeConversationBot {
         "enviando digitos do documento"
       );
       
-      await this.client.sendMessage(digitsToSend);
+      await this.sendMessageWithRetry(digitsToSend, "digitos do documento");
       const response = await this.wait("WAITING_PDF_OR_DIGITS_RETRY", [
         ...documentDigitsInvalidPatterns,
+        ...documentDigitsRequestPatterns,
         ...birthDateRequestPatterns,
+        ...rgDigitsRequestPatterns,
         ...pdfReadyPatterns,
         ...moreInvoiceQuestionPatterns,
         ...invalidDataPatterns,
@@ -1111,6 +1205,9 @@ export class CeeeConversationBot {
           "referencia da fatura recebida como legenda do PDF; seguindo para download"
         );
         return;
+      }
+      if (isPedindoRg(response)) {
+        await this.finishRgRequiredConversation(job, attempt);
       }
       // Se está pedindo data de nascimento, tenta no próximo loop
       if (isPedindoDataDeNascimento(response)) {
@@ -1214,7 +1311,7 @@ export class CeeeConversationBot {
     return latestText;
   }
 
-  private async resetConversationAfterFailure(status: InvoiceStatus): Promise<void> {
+  protected async resetConversationAfterFailure(status: InvoiceStatus): Promise<void> {
     if (!["not_found", "invalid_data", "conversation_error", "timeout"].includes(status)) return;
 
     logger.info({ status }, "resetando conversa antes da proxima linha");
@@ -1252,7 +1349,7 @@ export class CeeeConversationBot {
       [[/codigo do pix|copia e cola/], ["Nao", "Não"], "Nao"],
       [[/receber alguma outra conta|deseja mais alguma fatura/], ["Nao", "Não"], "Nao"],
       [[/quer falar sobre mais alguma coisa/], ["Nao", "Não"], "Nao"],
-      [[/muito bom|neutro|muito ruim/], [env.DEFAULT_RATING], env.DEFAULT_RATING, true],
+      [[/muito bom|neutro|muito ruim/], [this.config.defaultRating], this.config.defaultRating, true],
       [[/que bom.*feliz.*ajudar/], [], "", true]
     ];
 
@@ -1278,7 +1375,7 @@ export class CeeeConversationBot {
     }
   }
 
-  private async finishConversationWithFollowUp(initialState: { answeredMoreSubject?: boolean } = {}): Promise<void> {
+  protected async finishConversationWithFollowUp(initialState: { answeredMoreSubject?: boolean } = {}): Promise<void> {
     const startedAt = Date.now();
     let answeredPix = false;
     let answeredMoreInvoice = false;
@@ -1321,8 +1418,8 @@ export class CeeeConversationBot {
 
       if (!answeredRating && matchesAny(text, ratingQuestionPatterns)) {
         answeredRating = true;
-        logger.info({ rating: env.DEFAULT_RATING }, "respondendo avaliacao final");
-        await this.client.sendMessage(env.DEFAULT_RATING);
+        logger.info({ rating: this.config.defaultRating }, "respondendo avaliacao final");
+        await this.client.sendMessage(this.config.defaultRating);
         continue;
       }
 
@@ -1421,8 +1518,8 @@ export class CeeeConversationBot {
 
       if (!answeredRating && matchesAny(text, ratingQuestionPatterns)) {
         answeredRating = true;
-        logger.info({ rating: env.DEFAULT_RATING }, "respondendo avaliacao final");
-        await this.client.sendMessage(env.DEFAULT_RATING);
+        logger.info({ rating: this.config.defaultRating }, "respondendo avaliacao final");
+        await this.client.sendMessage(this.config.defaultRating);
         continue;
       }
 
@@ -1530,7 +1627,7 @@ export class CeeeConversationBot {
     await delay(3000);
   }
 
-  private async answerYesAtConversationEnd(reason: string): Promise<void> {
+  protected async answerYesAtConversationEnd(reason: string): Promise<void> {
     logger.info({ reason }, "respondendo sim no encerramento");
     await this.client.sendOption(["Sim"], "Sim").catch(async (error) => {
       logger.warn({ error, reason }, "opcao sim do encerramento nao encontrada; enviando fallback textual");
@@ -1566,7 +1663,7 @@ export class CeeeConversationBot {
     });
   }
 
-  private async answerNoAtConversationEnd(reason: string): Promise<void> {
+  protected async answerNoAtConversationEnd(reason: string): Promise<void> {
     logger.info({ reason }, "respondendo nao no encerramento");
     await this.client.sendOption(["Nao", "NÃ£o"], "Nao").catch(async (error) => {
       logger.warn({ error, reason }, "opcao nao do encerramento nao encontrada; enviando fallback textual");
@@ -1574,22 +1671,48 @@ export class CeeeConversationBot {
     });
   }
 
-  private statusFromError(error: unknown): InvoiceStatus {
+  protected statusFromError(error: unknown): InvoiceStatus {
     if (error instanceof ConversationFailure) return error.status;
     if (error instanceof Error && error.message === "authentication_required") return "authentication_required";
+    if (this.isDeliveryNotConfirmedError(error)) return "authentication_required";
+    if (this.isEvolutionConnectionClosedError(error)) return "authentication_required";
     return "conversation_error";
   }
 
-  private async saveErrorEvidence(job: InvoiceJob): Promise<void> {
+  private isDeliveryNotConfirmedError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /delivery_not_confirmed/i.test(message);
+  }
+
+  private isEvolutionConnectionClosedError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /Evolution API .*sendText.*Connection Closed/i.test(message);
+  }
+
+  protected async saveErrorEvidence(job: InvoiceJob): Promise<void> {
     const base = sanitizeFilePart(job.codigoVenda || job.identificador);
     const reference = sanitizeFilePart(job.refOriginal || job.mesReferencia);
     const file = `${base}_${reference}_${timestampForFile()}.png`;
-    await this.client.screenshot(path.join(resolveProjectPath(env.OUTPUT_ERROR_SCREENSHOTS_DIR), file));
+    await this.client.screenshot(path.join(resolveProjectPath(this.config.outputErrorScreenshotsDir), file));
   }
 }
 
 function isTransitionOnlyText(text: string): boolean {
   const normalized = normalizeText(text);
+  if (
+    matchesAny(normalized, [
+      ...identifierRequestPatterns,
+      ...accountConfirmationPatterns,
+      ...invoiceServicePatterns,
+      ...documentDigitsRequestPatterns,
+      ...invoiceListPatterns,
+      ...paymentMethodPatterns,
+      ...pdfReadyPatterns
+    ])
+  ) {
+    return false;
+  }
+
   return (
     /tudo bem.*continuar preciso te identificar/.test(normalized) ||
     /so um momento/.test(normalized) ||

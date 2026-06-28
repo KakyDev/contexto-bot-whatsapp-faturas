@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { optionTextMatches } from "../src/services/whatsapp-client.js";
+import { chatTitleMatches, optionTextMatches } from "../src/services/whatsapp-client.js";
 
 describe("optionTextMatches", () => {
   it("nao confunde Confirmo com Nao confirmo", () => {
@@ -19,5 +19,13 @@ describe("optionTextMatches", () => {
   it("nao confunde codigo de pagamento com segunda via", () => {
     expect(optionTextMatches("Segunda via Fatura", "Codigo de Pagamento")).toBe(false);
     expect(optionTextMatches("Segunda via de Fatura", "Codigo de Pagamento")).toBe(false);
+  });
+});
+
+describe("chatTitleMatches", () => {
+  it("aceita apenas o chat designado, ignorando somente caixa e acentos", () => {
+    expect(chatTitleMatches("Equatorial Energia Maranhão", "Equatorial Energia Maranhao")).toBe(true);
+    expect(chatTitleMatches("Equatorial Energia Maranhão", "CEEE Grupo Equatorial")).toBe(false);
+    expect(chatTitleMatches("CEEE Grupo Equatorial", "CEEE Grupo Equatorial - outro")).toBe(false);
   });
 });

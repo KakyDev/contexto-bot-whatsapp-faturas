@@ -10,12 +10,15 @@ import {
   identifierRejectedPatterns,
   identifierRequestPatterns,
   invoiceListPatterns,
+  isPedindoDataDeNascimento,
+  isPedindoRg,
   matchesAny,
   moreInvoiceQuestionPatterns,
   noOpenDebtsPatterns,
   paymentMethodPatterns,
   pdfReadyPatterns,
   ratingQuestionPatterns,
+  resolutionQuestionPatterns,
   suspendedSupplyQuestionPatterns,
   unsupportedSubjectPatterns
 } from "../src/utils/conversation-matchers.js";
@@ -57,10 +60,51 @@ Por favor, digite o numero do CPF, CNPJ do titular ou a unidade consumidora para
     expect(describeConversationIntent(text)).toBe("identifier_request");
   });
 
+  it("prioriza confirmacao de conta recebida depois do pedido de UC", () => {
+    const text = `
+Por favor, digite o numero do CPF, CNPJ do titular ou a unidade consumidora para o qual voce deseja atendimento.
+66175607
+So um momento enquanto consulto o nosso sistema.
+Achei!
+So pra confirmar: o seu atendimento sera para a unidade consumidora que esta em nome de JONES.
+Voce confirma?
+Confirmo
+Nao confirmo
+`;
+
+    expect(describeConversationIntent(text)).toBe("account_confirmation");
+  });
+
+  it("reconhece confirmacao de imovel do Maranhao depois do pedido de UC", () => {
+    const text = `
+Agora, informe o CPF ou CNPJ da pessoa titular da conta, ou a Unidade Consumidora do imovel, usando so numeros, sem pontos ou tracos.
+3024679100
+Encontrei um imovel nesse cadastro por aqui em nome de ASSOCIACAO.
+A sua Conta Contrato atual e 003024679100. A partir de agora, sera denominada Unidade Consumidora, cuja numeracao sera 003115166101602.
+E para esse imovel que voce deseja atendimento?
+Sim
+Nao
+`;
+
+    expect(describeConversationIntent(text)).toBe("account_confirmation");
+  });
+
   it("nao confunde validacao por cpf ou cnpj com pedido inicial de identificador", () => {
     const text = "Digite os 4 primeiros digitos do CPF ou CNPJ de quem e titular da conta.";
 
     expect(describeConversationIntent(text)).toBe("document_digits_request");
+  });
+
+  it("nao confunde pedido de data de nascimento com RG", () => {
+    const dataText = `
+Ok. Pra te enviar a conta, preciso fazer uma validacao de seguranca.
+Digite a data de nascimento de quem e titular da conta, no formato dd/mm/aaaa.
+`;
+    const rgText = "Digite os 4 primeiros digitos do RG de quem e titular da conta.";
+
+    expect(isPedindoDataDeNascimento(dataText)).toBe(true);
+    expect(isPedindoRg(dataText)).toBe(false);
+    expect(isPedindoRg(rgText)).toBe(true);
   });
 
   it("reconhece rejeicao da UC com nova solicitacao de CPF/CNPJ ou UC", () => {
@@ -91,6 +135,19 @@ Qual conta voce quer receber agora? E so digitar apenas o numero da opcao deseja
     expect(matchesAny("O numero digitado esta invalido. Vamos tentar de novo.", documentDigitsInvalidPatterns)).toBe(true);
   });
 
+  it("prioriza validacao de seguranca mesmo quando a Evolution anexa menu antigo", () => {
+    const text = `
+Ok. Pra te enviar a conta, preciso fazer uma validacao de seguranca.
+
+Digite os 4 primeiros digitos do CPF ou CNPJ de quem e titular da conta, usando apenas numeros.
+
+Sobre o que voce quer falar?
+6. Segunda via de Fatura
+`;
+
+    expect(describeConversationIntent(text)).toBe("document_digits_request");
+  });
+
   it("reconhece menu de pagamento com botao pagar boleto", () => {
     const text = `
 Posso te enviar essa conta por aqui ou te mando um link do site pra pagar no cartao debito/credito.
@@ -118,6 +175,21 @@ Pagar com codigo
     expect(describeConversationIntent(text)).toBe("invoice_list");
   });
 
+  it("reconhece mensagens de reinicio durante recuperacao", () => {
+    expect(describeConversationIntent("Bem-vindo ao atendimento da CEEE")).toBe("consent_request");
+    expect(describeConversationIntent("Digite seu CPF para continuar")).toBe("identifier_request");
+    expect(describeConversationIntent("Informe a UC para atendimento")).toBe("identifier_request");
+  });
+
+  it("reconhece pedido de UC mesmo com texto de identificacao da Clara", () => {
+    const text = `
+Tudo bem, mas para continuar preciso te identificar.
+Por favor, digite o numero do CPF, o CNPJ do titular ou a unidade consumidora para o qual voce deseja atendimento.
+`;
+
+    expect(describeConversationIntent(text)).toBe("identifier_request");
+  });
+
   it("reconhece mensagem de assunto fora do fluxo", () => {
     const text = `
 Poxa, eu ainda nao consigo te ajudar com esse assunto por aqui.
@@ -140,6 +212,20 @@ Segunda via de Fatura.
 `;
 
     expect(describeConversationIntent(text)).toBe("invoice_service_options");
+  });
+
+  it("reconhece menu e pesquisa final do Maranhao", () => {
+    const menu = `
+Sobre o que voce quer falar?
+
+1. Falta de Energia
+6. Segunda via de Fatura
+`;
+    const finalSurvey = "Voce conseguiu resolver a sua solicitacao? 3 - Sim 2 - Parcialmente 1 - Nao";
+
+    expect(describeConversationIntent(menu)).toBe("invoice_service_options");
+    expect(matchesAny(finalSurvey, resolutionQuestionPatterns)).toBe(true);
+    expect(describeConversationIntent(finalSurvey)).toBe("resolution_question");
   });
 
   it("reconhece pergunta de fornecimento suspenso para escolher outro assunto", () => {

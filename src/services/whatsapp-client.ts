@@ -36,6 +36,15 @@ export function optionTextMatches(label: string, candidate: string): boolean {
   );
 }
 
+export function chatTitleMatches(expectedChatName: string, actualChatName: string): boolean {
+  return normalizeText(actualChatName) === normalizeText(expectedChatName);
+}
+
+export interface WhatsAppClientOptions {
+  browserProfileDir?: string;
+  outputInvoicesDir?: string;
+}
+
 export class WhatsAppClient {
   private context?: BrowserContext;
   private page?: Page;
@@ -44,11 +53,15 @@ export class WhatsAppClient {
   private observedMessageCount = 0;
   private observedIncomingMessageCount = 0;
   private observedLatestIncomingText = "";
+  private expectedChatName = "";
 
-  constructor(private readonly actionDelayMs: number) {}
+  constructor(
+    private readonly actionDelayMs: number,
+    private readonly options: WhatsAppClientOptions = {}
+  ) {}
 
   async open(): Promise<void> {
-    this.context = await chromium.launchPersistentContext(resolveProjectPath(env.BROWSER_PROFILE_DIR), {
+    this.context = await chromium.launchPersistentContext(resolveProjectPath(this.options.browserProfileDir ?? env.BROWSER_PROFILE_DIR), {
       headless: env.HEADLESS,
       acceptDownloads: true
     });
@@ -75,12 +88,14 @@ export class WhatsAppClient {
     if (!authenticated && hasQr) throw new Error("authentication_required");
   }
 
-  async openConversationByPhone(contactPhone: string): Promise<void> {
+  async openConversationByPhone(contactPhone: string, expectedChatName: string): Promise<void> {
     const page = this.getPage();
     await this.assertAuthenticated();
     const phone = contactPhone.replace(/\D/g, "");
     await page.goto(`${env.WHATSAPP_WEB_URL}/send?phone=${phone}`, { waitUntil: "domcontentloaded" });
     await this.waitForComposer();
+    this.expectedChatName = expectedChatName;
+    await this.assertCurrentChatIdentity();
     await this.markCurrentConversationPoint();
   }
 
@@ -101,6 +116,7 @@ export class WhatsAppClient {
 
   async sendMessage(text: string): Promise<void> {
     await delay(this.actionDelayMs);
+    await this.assertCurrentChatIdentity();
     const box = await this.waitForComposer();
     await this.markCurrentConversationPoint();
     await box.click();
@@ -110,6 +126,7 @@ export class WhatsAppClient {
 
   async clickOption(labels: string[]): Promise<boolean> {
     await delay(this.actionDelayMs);
+    await this.assertCurrentChatIdentity();
     const page = this.getPage();
 
     const clickedRecentIncomingOption = await this.clickOptionInRecentIncomingMessage(labels);
@@ -219,6 +236,26 @@ export class WhatsAppClient {
     const clicked = await this.clickOption(labels);
     if (!clicked) {
       await this.sendMessage(fallback);
+    }
+  }
+
+  private async assertCurrentChatIdentity(): Promise<void> {
+    if (!this.expectedChatName) throw new Error("Nome do chat esperado nao foi definido");
+
+    const titles = await this.getPage().locator("#main header span[title]").evaluateAll((elements) =>
+      elements
+        .filter((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        })
+        .map((element) => element.getAttribute("title")?.trim() ?? "")
+        .filter(Boolean)
+    );
+    const actualChatName = titles.find((title) => chatTitleMatches(this.expectedChatName, title));
+    if (!actualChatName) {
+      throw new Error(
+        `Chat incorreto: esperado "${this.expectedChatName}", encontrado "${titles.join(" | ") || "titulo indisponivel"}". Envio bloqueado.`
+      );
     }
   }
 
@@ -426,7 +463,7 @@ export class WhatsAppClient {
       const page = this.documentPreviewPage?.isClosed() === false ? this.documentPreviewPage : this.getPage();
       const pdfBytes = await this.readPdfBytesFromPage(page).catch(() => undefined);
       if (pdfBytes && pdfBytes.length > 0) {
-        const targetDir = resolveProjectPath(env.OUTPUT_INVOICES_DIR);
+        const targetDir = resolveProjectPath(this.options.outputInvoicesDir ?? env.OUTPUT_INVOICES_DIR);
         fs.mkdirSync(targetDir, { recursive: true });
         const tempPath = path.join(targetDir, `download-${Date.now()}.pdf`);
         fs.writeFileSync(tempPath, pdfBytes);

@@ -75,6 +75,29 @@ describe("spreadsheet-reader", () => {
     fs.unlinkSync(file);
   });
 
+  it("le csv no layout Maranhao sem cpf e sem mes de referencia", () => {
+    const file = path.join(os.tmpdir(), `maranhao-${Date.now()}.csv`);
+    fs.writeFileSync(
+      file,
+      "codigo_venda;uc;data_de_nascimento\nOUCCWN7;3024685674;27/07/1984\n",
+      "utf8"
+    );
+
+    const [job] = readSpreadsheet(file, { bot: "maranhao" });
+
+    expect(job).toMatchObject({
+      id: "OUCCWN7_DINAMICO",
+      codigoVenda: "OUCCWN7",
+      identificador: "3024685674",
+      uc: "3024685674",
+      cpfCnpj: "",
+      mesReferencia: "DINAMICO",
+      refOriginal: "DINAMICO"
+    });
+
+    fs.unlinkSync(file);
+  });
+
   it("diferencia registros com mesmo codigo_venda e referencias diferentes", () => {
     const file = path.join(os.tmpdir(), `ceee-duplicado-${Date.now()}.csv`);
     fs.writeFileSync(

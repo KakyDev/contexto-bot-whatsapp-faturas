@@ -6,7 +6,8 @@ export const consentRequestPatterns = [
   /posso te atender/,
   /assistente virtual/,
   /sim,\s*clara/,
-  /ola,\s*eu sou a clara/
+  /ola,\s*eu sou a clara/,
+  /bem[-\s]?vindo/
 ];
 
 export const identifierRequestPatterns = [
@@ -14,6 +15,10 @@ export const identifierRequestPatterns = [
   /unidade consumidora/,
   /\buc\b/,
   /cpf.*cnpj.*unidade consumidora/,
+  /digite.*cpf/,
+  /digite.*cnpj/,
+  /informe.*uc/,
+  /informe.*unidade consumidora/,
   /digite.*numero/,
   /informe.*numero/
 ];
@@ -29,12 +34,14 @@ export const accountConfirmationPatterns = [
   /so pra confirmar/,
   /so para confirmar/,
   /atendimento sera para/,
+  /e para esse imovel que voce deseja atendimento/,
   /em nome de/,
   /conta contrato atual/
 ];
 
 export const invoiceServicePatterns = [
   /sobre o que voce gostaria de falar hoje/,
+  /sobre o que voce quer falar/,
   /segunda via/,
   /emitir.*fatura/,
   /fatura de energia/,
@@ -70,8 +77,7 @@ export const birthDateRequestPatterns = [
 export const rgDigitsRequestPatterns = [
   /4 primeiros digitos do rg/,
   /quatro primeiros digitos do rg/,
-  /digitos do rg/,
-  /validacao de seguranca/
+  /digitos do rg/
 ];
 
 export const documentDigitsRequestPatterns = [
@@ -80,7 +86,8 @@ export const documentDigitsRequestPatterns = [
   ...birthDateRequestPatterns,
   ...rgDigitsRequestPatterns,
   /cpf ou cnpj/,
-  /validacao de seguranca/
+  /validacao de seguranca/,
+  /email cadastrado/
 ];
 
 export const documentDigitsInvalidPatterns = [
@@ -158,6 +165,7 @@ export const ratingQuestionPatterns = [
 ];
 export const donePatterns = [/que bom.*feliz.*ajudar/, /fico muito feliz.*ajudar/];
 export const finalGoodbyePatterns = [/tchau/, /ate a proxima/, /agradecemos seu contato/, /obrigada por compartilhar/];
+export const resolutionQuestionPatterns = [/voce conseguiu resolver/, /resolveu.*solicitacao/];
 
 export const conversationRecoveryPatterns = [
   ...invalidDataPatterns,
@@ -177,6 +185,7 @@ export const conversationRecoveryPatterns = [
   ...moreInvoiceQuestionPatterns,
   ...moreSubjectQuestionPatterns,
   ...ratingQuestionPatterns,
+  ...resolutionQuestionPatterns,
   ...donePatterns,
   ...finalGoodbyePatterns
 ];
@@ -204,12 +213,27 @@ export function isPedindoRg(text: string): boolean {
 
 export function describeConversationIntent(text: string): string {
   const normalized = normalizeText(text);
+  if (
+    /validacao de seguranca/.test(normalized) &&
+    matchesAny(normalized, documentDigitsRequestPatterns)
+  ) {
+    return "document_digits_request";
+  }
+
+  if (
+    matchesAny(normalized, documentDigitsInvalidPatterns) &&
+    matchesAny(normalized, documentDigitsRequestPatterns)
+  ) {
+    return "document_digits_request";
+  }
+
   const candidates: Array<{ intent: string; patterns: RegExp[]; priority: number }> = [
     { intent: "invalid_data", patterns: invalidDataPatterns, priority: 100 },
     { intent: "no_open_debts", patterns: noOpenDebtsPatterns, priority: 99 },
     { intent: "suspended_supply_question", patterns: suspendedSupplyQuestionPatterns, priority: 98 },
     { intent: "unsupported_subject", patterns: unsupportedSubjectPatterns, priority: 98 },
     { intent: "done", patterns: [...donePatterns, ...finalGoodbyePatterns], priority: 95 },
+    { intent: "resolution_question", patterns: resolutionQuestionPatterns, priority: 92 },
     { intent: "rating_question", patterns: ratingQuestionPatterns, priority: 90 },
     { intent: "more_subject_question", patterns: moreSubjectQuestionPatterns, priority: 85 },
     { intent: "more_invoice_question", patterns: moreInvoiceQuestionPatterns, priority: 80 },

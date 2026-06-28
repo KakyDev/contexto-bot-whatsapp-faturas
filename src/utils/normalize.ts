@@ -7,6 +7,7 @@ export function normalizeText(value: string): string {
     .normalize("NFD")
     .replace(/\p{Diacritic}/gu, "")
     .toLowerCase()
+    .replace(/[*_~`]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }

@@ -4,7 +4,7 @@ export interface ConversationClient {
   open(): Promise<void>;
   close(): Promise<void>;
   assertAuthenticated(): Promise<void>;
-  openConversationByPhone(contactPhone: string): Promise<void>;
+  openConversationByPhone(contactPhone: string, expectedChatName: string): Promise<void>;
   sendMessage(text: string): Promise<void>;
   sendOption(labels: string[], fallback: string): Promise<void>;
   waitForMessageMatching(
